@@ -33,6 +33,10 @@ GPL project intentionally. Preserve existing GPL notices where applicable.
 - Avoid expensive unnecessary work in the per-sample loop.
 - Use parameter smoothing for anything that can click.
 - Use SDRAM for large delay/freeze buffers.
+- Always use `hw.SetAudioBlockSize(1)` for this project. A previous v0.2 delay
+  build used block size 48 and produced a constant whine whenever wet signal
+  was present; block size 1 fixed it. Do not change the audio block size
+  without explicitly asking first.
 - Keep the dry path clean and preserve amp feel.
 - This is not an Echoplex/tape-delay clone.
 - Do not copy the Echoplex DSP identity from the Hothouse examples.
