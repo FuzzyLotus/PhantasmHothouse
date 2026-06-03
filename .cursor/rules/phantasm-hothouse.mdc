@@ -1,0 +1,49 @@
+---
+description: PhantasmHothouse project rules
+globs:
+  - "src/PhantasmHothouse/**"
+alwaysApply: true
+---
+
+# PhantasmHothouse Rules
+
+This is a Cleveland Music Co. Hothouse / Daisy Seed firmware project.
+
+The project is intentionally GPL.
+
+Main working folder:
+src/PhantasmHothouse
+
+Hard rules:
+- Do not edit files outside src/PhantasmHothouse unless explicitly asked.
+- Do not modify libDaisy.
+- Do not modify DaisySP.
+- Do not modify other Hothouse example projects.
+- Do not touch src/buzzbox_octa_squawker.
+- Always inspect before editing.
+- Make small incremental changes.
+- After every code change, build with:
+  make -C src/PhantasmHothouse clean
+  make -C src/PhantasmHothouse
+- If the build fails, stop and show the exact error.
+- Do not continue adding features on top of a broken build.
+- Keep the code readable and suitable for embedded real-time audio.
+- Avoid heap allocation in the audio callback.
+- Avoid expensive unnecessary work in the per-sample loop.
+- Use smoothing for parameters that can click.
+- Use SDRAM for large delay/freeze buffers.
+- Keep the dry path clean and preserve amp feel.
+
+Project identity:
+- This is not an Echoplex or tape-delay clone.
+- Do not copy the Echoplex DSP identity from the Hothouse examples.
+- The pedal is a Phantasmagoria-inspired reverse/freeze delay for Hothouse.
+- Keep my own delay, reverse, and freeze identity separate.
+
+Milestones:
+v0.1 Clean Hardware Skeleton
+v0.2 Basic Delay
+v0.3 Reverse Delay
+v0.4 Freeze
+v0.5 Accumulate / Performance Behavior
+v1.0 Release
