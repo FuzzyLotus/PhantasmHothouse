@@ -42,6 +42,41 @@ GPL project intentionally. Preserve existing GPL notices where applicable.
 - Do not copy the Echoplex DSP identity from the Hothouse examples.
 - The final identity is a Phantasmagoria-inspired reverse/freeze delay for Hothouse.
 
+## Final Intended Control Layout
+
+This is the locked target control map. Controls may be read/smoothed before
+their feature exists, but their final meaning should not be reassigned.
+
+| Control | Name | Behavior |
+|---------|------|----------|
+| K1 | MIX | Overall dry / clean delay mix. |
+| K2 | TIME | Delay time, pad-focused. |
+| K3 | SUSTAIN | Feedback / buildup. |
+| K4 | HOLD | Held bed level. |
+| K5 | FILTER | Filtered repeats blend. |
+| K6 | SPACE | Reverb / reverse-reverb blend. |
+| SW1 | FX | UP = clean delay only; MIDDLE = filtered delay layer; DOWN = filtered delay + space/reverb layer. |
+| SW2 | DIR | UP = forward; MIDDLE = hybrid; DOWN = reverse / reverse space. |
+| SW3 | HOLD | UP = pure hold; MIDDLE = live delay over hold; DOWN = absorb / bleed. |
+| FS1 | HOLD | Hold/freeze performance control. |
+| FS2 | BYPASS | Effect on/off. |
+| LED1 | HOLD | Hold/freeze status. |
+| LED2 | EFFECT | Bypass/engaged status. |
+
+### DSP Architecture Note
+
+- The clean delay should remain the core signal.
+- Filter, space/reverb, and reverse/reverb are optional parallel layers blended
+  alongside the clean delay.
+- These layers must NOT permanently replace the clean delay; they sit beside it.
+
+### LED Handling Rule
+
+- `AudioCallback` may update logical state such as `bypass` and `fs1_held`.
+- `AudioCallback` must NOT call `led_*.Set()` or `led_*.Update()`.
+- LED Set/Update calls live in the `main` while loop.
+- `bypass` and `fs1_held` are `volatile bool` (written in audio, read in main).
+
 ## Milestones
 
 ### v0.1 Clean Hardware Skeleton

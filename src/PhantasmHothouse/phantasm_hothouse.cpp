@@ -14,6 +14,27 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+// ============================================================
+// Final intended control layout (locked target; see AGENTS.md)
+// ============================================================
+//   K1 MIX     Overall dry / clean delay mix.
+//   K2 TIME    Delay time, pad-focused.
+//   K3 SUSTAIN Feedback / buildup.
+//   K4 HOLD    Held bed level.                  (not implemented yet)
+//   K5 FILTER  Filtered repeats blend.          (currently plain tone LPF)
+//   K6 SPACE   Reverb / reverse-reverb blend.   (not implemented yet)
+//   SW1 FX     UP clean / MID filtered / DOWN filtered+space.
+//   SW2 DIR    UP forward / MID hybrid / DOWN reverse.
+//   SW3 HOLD   UP pure hold / MID live-over-hold / DOWN absorb-bleed.
+//   FS1 HOLD   Hold/freeze performance control. (placeholder: LED1 only)
+//   FS2 BYPASS Effect on/off.
+//   LED1 HOLD  Hold/freeze status.
+//   LED2 EFFECT Bypass/engaged status.
+//
+// DSP architecture: the clean delay is the core signal. Filter, space/reverb,
+// and reverse layers are optional PARALLEL blends alongside the clean delay;
+// they never permanently replace it. Only the clean delay + tone exist so far.
+
 // ### Uncomment if IntelliSense can't resolve DaisySP-LGPL classes ###
 // #include "daisysp-lgpl.h"
 
@@ -122,8 +143,9 @@ Lp1 tone_lpf;
 
 // Hardware state retained for later DSP milestones.
 Led led_freeze, led_effect;
-bool bypass = true;
-bool fs1_held = false;
+// Written in AudioCallback, read in main — volatile for cross-context visibility.
+volatile bool bypass = true;
+volatile bool fs1_held = false;
 float knob_values[Hothouse::KNOB_LAST] = {};
 Hothouse::ToggleswitchPosition toggle_positions[3] = {
     Hothouse::TOGGLESWITCH_UNKNOWN, Hothouse::TOGGLESWITCH_UNKNOWN,
@@ -190,7 +212,9 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
                    size_t size) {
   hw.ProcessAllControls();
 
-  bypass ^= hw.switches[Hothouse::FOOTSWITCH_2].RisingEdge();
+  if (hw.switches[Hothouse::FOOTSWITCH_2].RisingEdge()) {
+    bypass = !bypass;
+  }
   fs1_held = hw.switches[Hothouse::FOOTSWITCH_1].Pressed();
 
   for (size_t i = 0; i < Hothouse::KNOB_LAST; ++i) {
@@ -199,11 +223,6 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
   toggle_positions[0] = hw.GetToggleswitchPosition(Hothouse::TOGGLESWITCH_1);
   toggle_positions[1] = hw.GetToggleswitchPosition(Hothouse::TOGGLESWITCH_2);
   toggle_positions[2] = hw.GetToggleswitchPosition(Hothouse::TOGGLESWITCH_3);
-
-  led_freeze.Set(fs1_held ? 1.0f : 0.0f);
-  led_effect.Set(bypass ? 0.0f : 1.0f);
-  led_freeze.Update();
-  led_effect.Update();
 
   // Block-rate parameter targets.
   s_mix.target = knob_values[Hothouse::KNOB_1];
@@ -286,6 +305,12 @@ int main() {
 
   while (true) {
     hw.DelayMs(10);
+
+    // LEDs updated at ~100 Hz, not audio rate.
+    led_freeze.Set(fs1_held ? 1.0f : 0.0f);
+    led_effect.Set(bypass ? 0.0f : 1.0f);
+    led_freeze.Update();
+    led_effect.Update();
 
     // Call System::ResetToBootloader() if FOOTSWITCH_1 is pressed for 2 seconds
     hw.CheckResetToBootloader();
