@@ -42,32 +42,45 @@ GPL project intentionally. Preserve existing GPL notices where applicable.
 - Do not copy the Echoplex DSP identity from the Hothouse examples.
 - The final identity is a Phantasmagoria-inspired reverse/freeze delay for Hothouse.
 
-## Final Intended Control Layout
+## Final Physical Control Layout (LOCKED)
 
-This is the locked target control map. Controls may be read/smoothed before
-their feature exists, but their final meaning should not be reassigned.
+This is the locked physical layout. Controls may be read/smoothed before their
+feature exists, but their final meaning and physical position must not be
+reassigned.
 
-| Control | Name | Behavior |
-|---------|------|----------|
-| K1 | MIX | Overall dry / clean delay mix. |
-| K2 | TIME | Delay time, pad-focused. |
-| K3 | SUSTAIN | Feedback / buildup. |
-| K4 | HOLD | Held bed level. |
-| K5 | FILTER | Filtered repeats blend. |
-| K6 | SPACE | Reverb / reverse-reverb blend. |
-| SW1 | FX | UP = clean delay only; MIDDLE = filtered delay layer; DOWN = filtered delay + space/reverb layer. |
-| SW2 | DIR | UP = forward; MIDDLE = hybrid; DOWN = reverse / reverse space. |
-| SW3 | HOLD | UP = pure hold; MIDDLE = live delay over hold; DOWN = absorb / bleed. |
-| FS1 | HOLD | Hold/freeze performance control. |
-| FS2 | BYPASS | Effect on/off. |
-| LED1 | HOLD | Hold/freeze status. |
-| LED2 | EFFECT | Bypass/engaged status. |
+Physical grouping concept:
+- Top row knobs = clean delay engine.
+- Bottom row knobs = performance layers.
+- Switch row = mode / world selectors.
+
+```
+Top row knobs:      K1 MIX        K2 TIME       K3 SUSTAIN
+Bottom row knobs:   K4 HOLD       K5 FILTER     K6 SPACE
+Switch row:         SW1 FX        SW2 DIR       SW3 HOLD
+Footswitches:       FS1 HOLD      FS2 BYPASS
+```
+
+| Control | Row | Name | Behavior |
+|---------|-----|------|----------|
+| K1 | top | MIX | Overall dry / clean delay mix. |
+| K2 | top | TIME | Delay time, pad-focused. |
+| K3 | top | SUSTAIN | Feedback / buildup. |
+| K4 | bottom | HOLD | Held bed level. |
+| K5 | bottom | FILTER | Filtered repeats blend. |
+| K6 | bottom | SPACE | Reverb / reverse-reverb blend. |
+| SW1 | switch | FX | UP = clean delay only; MIDDLE = filtered delay layer; DOWN = filtered delay + space/reverb layer. |
+| SW2 | switch | DIR | UP = forward; MIDDLE = hybrid; DOWN = reverse / reverse space. |
+| SW3 | switch | HOLD | UP = pure hold; MIDDLE = live delay over hold; DOWN = absorb / bleed. |
+| FS1 | footsw | HOLD | Hold/freeze performance control. |
+| FS2 | footsw | BYPASS | Effect on/off. |
+| LED1 | led | HOLD | Hold/freeze status. |
+| LED2 | led | EFFECT | Bypass/engaged status. |
 
 ### DSP Architecture Note
 
-- The clean delay should remain the core signal.
-- Filter, space/reverb, and reverse/reverb are optional parallel layers blended
-  alongside the clean delay.
+- The clean delay is the core signal (top row engine).
+- Filter, space/reverb, reverse/reverb, and hold are optional layers blended
+  around the clean delay (bottom row + switches).
 - These layers must NOT permanently replace the clean delay; they sit beside it.
 
 ### LED Handling Rule

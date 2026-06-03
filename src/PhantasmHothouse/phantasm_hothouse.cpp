@@ -15,25 +15,31 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 // ============================================================
-// Final intended control layout (locked target; see AGENTS.md)
+// Final physical control layout (LOCKED; see AGENTS.md)
 // ============================================================
+// Top row knobs (clean delay engine):
 //   K1 MIX     Overall dry / clean delay mix.
 //   K2 TIME    Delay time, pad-focused.
 //   K3 SUSTAIN Feedback / buildup.
+// Bottom row knobs (performance layers):
 //   K4 HOLD    Held bed level.                  (not implemented yet)
 //   K5 FILTER  Filtered repeats blend.          (currently plain tone LPF)
 //   K6 SPACE   Reverb / reverse-reverb blend.   (not implemented yet)
+// Switch row (mode / world selectors):
 //   SW1 FX     UP clean / MID filtered / DOWN filtered+space.
 //   SW2 DIR    UP forward / MID hybrid / DOWN reverse.
 //   SW3 HOLD   UP pure hold / MID live-over-hold / DOWN absorb-bleed.
+// Footswitches:
 //   FS1 HOLD   Hold/freeze performance control. (placeholder: LED1 only)
 //   FS2 BYPASS Effect on/off.
-//   LED1 HOLD  Hold/freeze status.
+// LEDs:
+//   LED1 HOLD   Hold/freeze status.
 //   LED2 EFFECT Bypass/engaged status.
 //
-// DSP architecture: the clean delay is the core signal. Filter, space/reverb,
-// and reverse layers are optional PARALLEL blends alongside the clean delay;
-// they never permanently replace it. Only the clean delay + tone exist so far.
+// DSP architecture: the clean delay (top row) is the core signal. Filter,
+// space/reverb, reverse, and hold are optional PARALLEL layers blended around
+// the clean delay (bottom row + switches); they never permanently replace it.
+// Only the clean delay + tone exist so far.
 
 // ### Uncomment if IntelliSense can't resolve DaisySP-LGPL classes ###
 // #include "daisysp-lgpl.h"
