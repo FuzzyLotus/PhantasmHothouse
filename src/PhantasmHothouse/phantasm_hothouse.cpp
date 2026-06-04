@@ -218,8 +218,9 @@ struct DelBuf {
 // interpolated main delay buffer. A grain phase ramps 0 -> 1; the read distance
 // behind the write pointer GROWS with phase, so playback walks from newer audio
 // toward older audio (the reverse feel). Two grains 180 degrees apart (phase and
-// phase + 0.5) are triangular-windowed and normalized by their window sum, which
-// keeps the reverse texture smooth and continuous instead of hard block reversal.
+// phase + 0.5) are Hann-windowed (raised cosine) and normalized by their window
+// sum, which keeps the reverse texture smooth and continuous (organic, not hard
+// block reversal). Hann windows sum to a constant at the 180-degree offset.
 struct ReverseGrainReader {
   float phase = 0.0f;
   float offset_ms = kReverseOffsetMs; // minimum read distance
@@ -248,9 +249,12 @@ struct ReverseGrainReader {
     float pb = phase + 0.5f;
     if (pb >= 1.0f) pb -= 1.0f;
 
-    // Triangular windows: 1 at grain center, 0 at the edges.
-    const float win_a = 1.0f - fabsf(2.0f * pa - 1.0f);
-    const float win_b = 1.0f - fabsf(2.0f * pb - 1.0f);
+    // Raised-cosine (Hann) windows: smoother grain fade-in/out than triangular,
+    // so hard attacks glue together instead of sounding choppy. With the second
+    // grain at phase + 0.5 the two Hann windows sum to a constant (~1.0), giving
+    // a continuous, even crossfade.
+    const float win_a = 0.5f - 0.5f * cosf(kTwoPi * pa);
+    const float win_b = 0.5f - 0.5f * cosf(kTwoPi * pb);
 
     const float ga = src.Read(ReadDistance(pa, sr, sweep_samps, mod_samps));
     const float gb = src.Read(ReadDistance(pb, sr, sweep_samps, mod_samps));
@@ -414,9 +418,9 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
 
     // ----- Phantasmagoria-style custom DelBuf engine (clean core) -----
     // Write dry + feedback; gently saturate the write when feedback is high so
-    // the loop compresses instead of running away. The feedback source is the
-    // SW2 direction voice (computed below), so in reverse modes the delay bed
-    // itself becomes reverse-influenced rather than purely forward.
+    // the loop compresses instead of running away. Feedback stays based on the
+    // clean forward path only; feeding reverse back into this same rolling buffer
+    // gets reversed again on later passes and turns forward-ish.
     float del_in = dry + fb_sig;
     if (s_feedback.current > 0.3f) {
       del_in = fast_tanh(del_in * 0.5f) * 2.0f;
@@ -462,17 +466,15 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
     //   UP     = forward only          (fwd 1.0  / rev 0.0)
     //   MIDDLE = hybrid forward+reverse (fwd 0.75 / rev 0.45)
     //   DOWN   = reverse only           (fwd 0.0  / rev 1.0)
-    // The filter, space, and feedback all derive from this voice.
+    // The filter and space derive from this voice; the main buffer feedback stays
+    // clean-forward so reverse repeats do not become reverse-of-reverse.
     const float direction_voice =
         forward_voice * s_fwd_wet.current + reverse_voice * s_rev_wet.current;
 
-    // Feedback follows the direction voice. Uses the pre-saturation toned
-    // signals (wet_tone / reverse_soft) so SW2 UP reproduces the original
-    // forward feedback exactly, while SW2 DOWN feeds the reverse voice back into
-    // the delay bed for cohesion. No second tone filter needed.
-    float fb_source =
-        wet_tone * s_fwd_wet.current + reverse_soft * s_rev_wet.current;
-    fb_sig = fb_source * s_feedback.current;
+    // Main delay feedback remains clean-forward in all SW2 modes. The audible
+    // wet voice can be reverse-only, but the rolling buffer should not contain
+    // reverse-fed repeats that get reversed again on the next pass.
+    fb_sig = wet_tone * s_feedback.current;
     if (IsBad(fb_sig)) fb_sig = 0.0f;
 
     // ----- Parallel FILTER layer (SW1 + K5), fed from the DIRECTION voice -----
