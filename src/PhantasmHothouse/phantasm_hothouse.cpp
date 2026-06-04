@@ -23,12 +23,12 @@
 //   K3 SUSTAIN Feedback / buildup.
 // Bottom row knobs (performance layers):
 //   K4 HOLD    Held bed level.                  (not implemented yet)
-//   K5 FILTER  Filtered repeats blend.          (currently plain tone LPF)
-//   K6 SPACE   Reverb / reverse-reverb blend.   (not implemented yet)
+//   K5 FILTER  Filtered repeats blend.          (v0.3.1: parallel band-pass layer)
+//   K6 SPACE   Reverb / reverse-reverb blend.   (read/smoothed, not used yet)
 // Switch row (mode / world selectors):
-//   SW1 FX     UP clean / MID filtered / DOWN filtered+space.
-//   SW2 DIR    UP forward / MID hybrid / DOWN reverse.
-//   SW3 HOLD   UP pure hold / MID live-over-hold / DOWN absorb-bleed.
+//   SW1 FX     UP clean / MID filtered / DOWN filtered+space(reserved).
+//   SW2 DIR    UP forward / MID hybrid / DOWN reverse.        (read, unused)
+//   SW3 HOLD   UP pure hold / MID live-over-hold / DOWN absorb-bleed. (unused)
 // Footswitches:
 //   FS1 HOLD   Hold/freeze performance control. (placeholder: LED1 only)
 //   FS2 BYPASS Effect on/off.
@@ -54,6 +54,7 @@ using clevelandmusicco::Hothouse;
 using daisy::AudioHandle;
 using daisy::Led;
 using daisy::SaiHandle;
+using daisy::System;
 using daisysp::fclamp;
 using daisysp::fonepole;
 
@@ -70,6 +71,18 @@ static constexpr float kTimeMinMs = 20.0f;
 static constexpr float kTimeMaxMs = 1800.0f;
 
 static constexpr float kMaxFeedback = 0.78f;
+
+// Fixed tone of the clean delay / feedback path (was K5-driven before v0.3).
+static constexpr float kFeedbackToneHz = 8000.0f;
+
+// Parallel FILTER layer (K5): an explicit band-pass for an obvious, characterful
+// "filtered repeats" texture rather than a subtly-darker delay.
+static constexpr float kFilterHpHz = 500.0f;     // high-pass corner (narrow mid band)
+static constexpr float kFilterLpHz = 1400.0f;    // low-pass corner
+static constexpr float kFilterMakeup = 3.5f;     // band-pass loses energy; compensate
+// Clean delay retained underneath even at K5 = 100% (stays audible, but the
+// filtered layer clearly dominates at max).
+static constexpr float kFilterCleanFloor = 0.25f;
 
 // ============================================================
 // Fast math / saturation (Phantasmagoria feel)
@@ -103,6 +116,22 @@ struct Lp1 {
   inline float Process(float x) {
     y += c * (x - y);
     return y;
+  }
+};
+
+// One-pole high-pass (returns input minus its low-passed part).
+struct Hp1 {
+  float y = 0.0f;
+  float c = 1.0f;
+
+  void Init(float freq, float sr) {
+    y = 0.0f;
+    SetFreq(freq, sr);
+  }
+  void SetFreq(float freq, float sr) { c = 1.0f - expf(-kTwoPi * freq / sr); }
+  inline float Process(float x) {
+    y += c * (x - y);
+    return x - y;
   }
 };
 
@@ -145,7 +174,9 @@ static float DSY_SDRAM_BSS main_buf[kMaxDelay];
 
 Hothouse hw;
 DelBuf main_delay;
-Lp1 tone_lpf;
+Lp1 tone_lpf;     // fixed tone on the clean delay / feedback path
+Hp1 filter_hp;    // parallel FILTER-layer band-pass: high-pass stage (K5)
+Lp1 filter_lp;    // parallel FILTER-layer band-pass: low-pass stage (K5)
 
 // Hardware state retained for later DSP milestones.
 Led led_freeze, led_effect;
@@ -173,7 +204,9 @@ struct Smoothed {
 Smoothed s_delay{2400.0f, 2400.0f, 0.0002f};  // samples — slow, click-free
 Smoothed s_feedback{0.0f, 0.0f, 0.0010f};      // K3 sustain / feedback
 Smoothed s_mix{0.0f, 0.0f, 0.0010f};           // K1 mix
-Smoothed s_tone{9000.0f, 9000.0f, 0.05f};      // K5 tone (Hz), block-rate
+Smoothed s_filter{0.0f, 0.0f, 0.0010f};        // K5 FILTER blend (0..1)
+Smoothed s_fx_gate{0.0f, 0.0f, 0.0015f};       // SW1 FX enable (click-free)
+Smoothed s_space{0.0f, 0.0f, 0.0010f};         // K6 SPACE — read/smoothed, unused
 
 // ============================================================
 // K2 TIME — pad-focused piecewise curve
@@ -195,12 +228,6 @@ static float KnobToDelayMs(float knob) {
 static float KnobToDelaySamples(float knob) {
   const float ms = fclamp(KnobToDelayMs(knob), kTimeMinMs, kTimeMaxMs);
   return ms * (sample_rate / 1000.0f);
-}
-
-// K5 tone: CCW dark (~1200 Hz) → CW bright (~9000 Hz).
-static float KnobToToneHz(float knob) {
-  const float t = fclamp(knob, 0.0f, 1.0f);
-  return 1200.0f * powf(9000.0f / 1200.0f, t);
 }
 
 static inline void EqualPowerGains(float mix, float* dry_gain, float* wet_gain) {
@@ -234,11 +261,13 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
   s_mix.target = knob_values[Hothouse::KNOB_1];
   s_delay.target = KnobToDelaySamples(knob_values[Hothouse::KNOB_2]);
   s_feedback.target = fclamp(knob_values[Hothouse::KNOB_3], 0.0f, kMaxFeedback);
-  s_tone.target = KnobToToneHz(knob_values[Hothouse::KNOB_5]);
+  s_filter.target = fclamp(knob_values[Hothouse::KNOB_5], 0.0f, 1.0f);
+  s_space.target = fclamp(knob_values[Hothouse::KNOB_6], 0.0f, 1.0f);
 
-  // Tone updated once per block (no per-sample expf).
-  s_tone.Tick();
-  tone_lpf.SetFreq(s_tone.current, sample_rate);
+  // SW1 FX: UP = clean only (gate 0); MIDDLE/DOWN = filtered layer (gate 1).
+  // DOWN behaves as MIDDLE for now; SPACE/reverb is added here next milestone.
+  s_fx_gate.target =
+      (toggle_positions[0] == Hothouse::TOGGLESWITCH_UP) ? 0.0f : 1.0f;
 
   for (size_t i = 0; i < size; ++i) {
     const float dry = in[0][i];
@@ -253,8 +282,11 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
     s_delay.Tick();
     s_mix.Tick();
     s_feedback.Tick();
+    s_filter.Tick();
+    s_fx_gate.Tick();
+    s_space.Tick();
 
-    // ----- Phantasmagoria-style custom DelBuf engine -----
+    // ----- Phantasmagoria-style custom DelBuf engine (clean core) -----
     // Write dry + feedback; gently saturate the write when feedback is high
     // so the loop compresses instead of running away.
     float del_in = dry + fb_sig;
@@ -269,9 +301,28 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
     float wet = main_delay.Read(read_pos);
     if (IsBad(wet)) wet = 0.0f;
 
-    // K5 tone shapes the wet/feedback signal (dark -> bright).
+    // Clean delay path (fixed tone) — this is the core signal and the ONLY
+    // thing fed back, so the feedback loop is unaffected by the FX layer.
     const float wet_tone = tone_lpf.Process(wet);
     fb_sig = wet_tone * s_feedback.current;
+    const float clean_layer = gentle_saturate(wet_tone);
+
+    // ----- Parallel FILTER layer (SW1 + K5) -----
+    // Band-pass (high-pass -> low-pass) copy of the same delay read, with makeup
+    // gain, blended ALONGSIDE the clean delay for an obvious filtered-repeats
+    // texture. Filter state advances every sample (even when disabled) so there
+    // is no click when SW1 enables it. The clean delay always stays underneath.
+    const float band = filter_lp.Process(filter_hp.Process(wet));
+    float filtered_layer = gentle_saturate(band * kFilterMakeup);
+    // Mild extra saturation so the louder filtered layer stays smooth, not harsh.
+    filtered_layer = gentle_saturate(filtered_layer * 1.2f);
+    // K5 curve so the filtered layer enters faster (25% already clearly filtered).
+    const float gate = fclamp(s_fx_gate.current * s_filter.current, 0.0f, 1.0f);
+    const float f = powf(gate, 0.65f);
+    // Clean tapers down to kFilterCleanFloor; filtered layer is ADDED so K5 is
+    // mostly a "how much filtered layer" control and dominates at max.
+    const float clean_gain = 1.0f - (1.0f - kFilterCleanFloor) * f;
+    const float delay_out = clean_layer * clean_gain + filtered_layer * f;
 
     // Constant-power dry/wet mix; pure dry at K1 minimum.
     float out_mono;
@@ -281,8 +332,7 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
       float dry_gain = 1.0f;
       float wet_gain = 0.0f;
       EqualPowerGains(s_mix.current, &dry_gain, &wet_gain);
-      const float wet_out = gentle_saturate(wet_tone);
-      out_mono = dry * dry_gain + wet_out * wet_gain;
+      out_mono = dry * dry_gain + delay_out * wet_gain;
     }
 
     if (IsBad(out_mono)) out_mono = dry;
@@ -301,7 +351,9 @@ int main() {
   sample_rate = hw.AudioSampleRate();
 
   main_delay.Init(main_buf, kMaxDelay);
-  tone_lpf.Init(9000.0f, sample_rate);
+  tone_lpf.Init(kFeedbackToneHz, sample_rate);
+  filter_hp.Init(kFilterHpHz, sample_rate);
+  filter_lp.Init(kFilterLpHz, sample_rate);
 
   led_freeze.Init(hw.seed.GetPin(Hothouse::LED_1), false);
   led_effect.Init(hw.seed.GetPin(Hothouse::LED_2), false);

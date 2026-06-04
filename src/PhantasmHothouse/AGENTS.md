@@ -24,8 +24,13 @@ GPL project intentionally. Preserve existing GPL notices where applicable.
   ```bash
   make -C src/PhantasmHothouse clean
   make -C src/PhantasmHothouse
+  make -C src/PhantasmHothouse program-dfu
   ```
 
+- The flash artifact for this project is `src/PhantasmHothouse/build/phantasm_hothouse.bin`.
+  When summarizing build output, refer to the `.bin` as the flash target, not
+  the `.hex`. Flash via `make -C src/PhantasmHothouse program-dfu` (uses the
+  `.bin`); do not instruct flashing the `.hex`.
 - If the build fails, stop and show the exact error.
 - Do not continue adding features on top of a broken build.
 - Keep the code readable and suitable for embedded real-time audio.
