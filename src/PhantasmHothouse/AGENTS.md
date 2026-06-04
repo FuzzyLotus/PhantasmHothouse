@@ -378,6 +378,169 @@ The reference sound is:
 
 The pedal should feel like a small table-top performance instrument for building delay beds, filtered textures, and space layers.
 
+## Phantasmagoria Reverse Identity
+
+The reverse behavior is one of the main reasons the client hired David for this project.
+
+Do not implement a generic reverse delay.
+
+The reverse should take direct inspiration from David's Phantasmagoria reverse function.
+
+Important traits from Phantasmagoria:
+- reverse is based on a GrainReader-style reader
+- it sweeps backward through the delay history
+- it uses a windowed grain
+- it uses overlapping dual grains offset by 180 degrees
+- the overlapping grains should smooth the reverse texture and avoid hard chopping
+- the result should feel like a smooth reverse delay/reverse pad texture, not a glitchy backwards looper unless intentionally pushed later
+
+For PhantasmHothouse:
+- use the current clean delay buffer as the source
+- keep the clean forward delay as the core signal
+- add the reverse as a parallel layer
+- do not let reverse destroy or replace the clean delay
+- SW2 controls the reverse amount / direction world
+
+SW2 DIR:
+- UP = forward only
+- MIDDLE = hybrid forward + reverse texture
+- DOWN = stronger reverse / reverse-space texture
+
+The reverse layer should be musical, smooth, pad-friendly, and useful for table performance.
+It should preserve the feeling of the original Phantasmagoria reverse function while fitting the Hothouse control layout.
+
+## Exact Phantasmagoria Reverse Algorithm
+
+The reverse algorithm the client liked is not a generic reverse delay.
+
+It should be referred to as:
+
+"Phantasmagoria dual-grain reverse reader"
+
+or more technically:
+
+"dual-overlap triangular-window granular reverse reader over a rolling interpolated delay buffer."
+
+Core behavior:
+
+### 1. Source buffer
+- Use the same rolling delay history buffer as the clean delay.
+- The buffer is a circular delay buffer with interpolated fractional reads.
+- The reader reads a number of samples behind the current write pointer.
+
+### 2. Reverse sweep principle
+- A grain phase runs from 0.0 to 1.0.
+- The read distance is calculated from that phase:
+
+  ```
+  readSamples = phase * sweepMs * sampleRate / 1000
+              + offsetMs * sampleRate / 1000
+              + modulationSamples
+  ```
+
+- Because the read distance increases as phase increases, the reader moves from newer audio toward older audio.
+- Moving from newer audio toward older audio creates the reverse playback feel.
+
+### 3. Phantasmagoria reference settings
+- The original Phantasmagoria reverse reader was initialized like:
+
+  ```
+  phase = 0.0
+  freq = 1.0 Hz
+  sweepMs = 1999 ms
+  offsetMs = 1 ms
+  dual = true
+  ```
+
+- At 48 kHz, this sweeps almost the full 2-second main delay buffer.
+
+### 4. Windowing
+- Each grain uses a triangular window:
+
+  ```
+  win = 1.0 - abs(2.0 * phase - 1.0)
+  ```
+
+- This fades the grain in and out and avoids hard clicks.
+
+### 5. Dual-grain overlap
+- A second grain is read at:
+
+  ```
+  phaseB = phase + 0.5
+  wrap if phaseB >= 1.0
+  ```
+
+- This creates two grains 180 degrees apart.
+- The overlapping windows keep the reverse sound continuous instead of choppy.
+
+### 6. Normalization
+- The grain outputs are summed and divided by:
+
+  ```
+  max(winA + winB, 0.001)
+  ```
+
+- This keeps the reverse output level stable during overlap.
+
+### 7. Modulation
+- The reverse reader can accept modulationSamples.
+- In Phantasmagoria, tape-warble modulation was added to both forward and reverse read positions.
+- For PhantasmHothouse, modulation should be added carefully and only after the base reverse is stable.
+
+### 8. Integration in Phantasmagoria
+- The main delay writes:
+
+  ```
+  dry + feedback
+  ```
+
+- The forward path reads:
+
+  ```
+  mainDelay.Read(smoothedDelay + modulation)
+  ```
+
+- The reverse path reads:
+
+  ```
+  revReader.Process(mainDelay, sampleRate, modulation)
+  ```
+
+- Direction is a smoothed crossfade:
+
+  ```
+  outputDelay = forward * (1.0 - directionAmount)
+              + reverse * directionAmount
+  ```
+
+### 9. PhantasmHothouse adaptation
+- Use the current PhantasmHothouse clean delay buffer as the source.
+- Keep the clean delay as the core signal.
+- Add the reverse as a parallel layer.
+- SW2 DIR should control the reverse amount:
+  - UP = forward only
+  - MIDDLE = hybrid forward + reverse texture
+  - DOWN = stronger reverse / reverse-space texture
+
+### 10. Design warning
+- Do not implement a generic reverse delay.
+- Do not implement hard block reversal.
+- Do not implement a separate reverse buffer unless explicitly needed later.
+- Do not make reverse replace the clean delay.
+- The goal is the smooth Phantasmagoria dual-grain reverse texture.
+
+### 11. SW2 DIR refinement
+
+SW2 DIR:
+- UP = forward
+- MIDDLE = hybrid forward + reverse texture
+- DOWN = reverse-focused
+
+In SW2 DOWN, the wet delay/space layer should be mostly or fully reverse. This mode should not preserve the clean forward wet delay strongly, because SW2 MIDDLE already covers the hybrid case.
+
+K1 MIX may still pass dry input normally, but the effected wet voice should be reverse-dominant.
+
 ## Project separation
 
 Do not confuse PhantasmHothouse with MoonChild or Flux Apparition.

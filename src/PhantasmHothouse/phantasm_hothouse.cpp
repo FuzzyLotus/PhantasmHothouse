@@ -27,7 +27,7 @@
 //   K6 SPACE   Reverb / space blend.            (v0.4: parallel reverb layer, SW1 DOWN)
 // Switch row (mode / world selectors):
 //   SW1 FX     UP clean / MID filtered / DOWN filtered+space.
-//   SW2 DIR    UP forward / MID hybrid / DOWN reverse.        (read, unused)
+//   SW2 DIR    UP forward / MID hybrid / DOWN reverse.  (v0.5: dual-grain reverse)
 //   SW3 HOLD   UP pure hold / MID live-over-hold / DOWN absorb-bleed. (unused)
 // Footswitches:
 //   FS1 HOLD   Hold/freeze performance control. (placeholder: LED1 only)
@@ -63,8 +63,10 @@ using daisysp::fonepole;
 static constexpr float kTwoPi = 6.28318530717958647692f;
 static constexpr float kHalfPi = 1.57079632679489661923f;
 
-// Phantasmagoria-style main buffer: 96000 samples == 2.0 s at 48 kHz.
-static constexpr size_t kMaxDelay = 96000;
+// Main delay buffer: 216000 samples == 4.5 s at 48 kHz. Larger than the audio
+// delay range so the reverse reader has room for a long perceived reverse event
+// (at normal reverse speed a perceived N-second event needs a ~2N-second sweep).
+static constexpr size_t kMaxDelay = 216000;
 
 static constexpr float kTimeMinMs = 20.0f;
 static constexpr float kTimeMaxMs = 1800.0f;
@@ -95,6 +97,36 @@ static constexpr float kRevFeedback = 0.6f;      // conservative decay for first
 static constexpr float kRevLpHz = 6000.0f;       // tame highs (pad-like, not harsh)
 static constexpr float kRevHpHz = 120.0f;        // remove rumble from the smear
 static constexpr float kSpaceLevel = 1.0f;       // makeup for the added space layer
+
+// Parallel REVERSE layer (SW2 DIR): the Phantasmagoria dual-grain reverse
+// reader sweeps the rolling main delay buffer. SW2 selects the wet direction
+// voice (forward / hybrid / reverse), which also feeds the filter, space, and
+// feedback source so the reverse bed stays glued to the delay.
+static constexpr float kReverseOffsetMs = 1.0f;    // tiny minimum read distance
+// K2 controls the PERCEIVED reverse event length. At normal reverse speed the
+// read distance must grow ~2 samples/sample, so a perceived event of E ms needs
+// a sweep of ~2*E ms of buffer history:
+//   sweepSamples = eventMs * kReverseSpeed * sr/1000
+//   freq         = kReverseSpeed * sr / sweepSamples   (== 1000 / eventMs)
+// This keeps correct reverse pitch/speed while K2 sets how long the reverse bed
+// feels (not just a fast 1 s grain).
+static constexpr float kReverseSpeed = 2.0f;          // read-distance growth (samp/samp)
+static constexpr float kReverseEventMinMs = 650.0f;   // shortest perceived reverse
+static constexpr float kReverseEventMaxMs = 1900.0f;  // longest perceived reverse
+// Reverse tone + a second light smoothing pole soften hard-attack grain
+// transients without over-darkening; the reverse stays clear and present.
+static constexpr float kReverseToneHz = 5500.0f;    // main reverse low-pass (conservative)
+static constexpr float kReverseSmoothHz = 6000.0f;  // extra light transient softener
+static constexpr float kReverseMakeup = 1.2f;       // keep reverse present, not smeared
+// SW2 DIR selects the wet delay VOICE (forward / hybrid / reverse). The same
+// amounts drive the direction voice, the filter source, the space source, and
+// the feedback source, so reverse stays glued to the delay bed.
+static constexpr float kFwdWetUp = 1.0f;     // UP: forward only
+static constexpr float kRevWetUp = 0.0f;
+static constexpr float kFwdWetMid = 0.75f;   // MIDDLE: forward clearly present...
+static constexpr float kRevWetMid = 0.45f;   //         ...with reverse blooming around it
+static constexpr float kFwdWetDown = 0.0f;   // DOWN: reverse only in the wet voice
+static constexpr float kRevWetDown = 1.0f;   //       reverse only
 
 // ============================================================
 // Fast math / saturation (Phantasmagoria feel)
@@ -180,6 +212,55 @@ struct DelBuf {
 };
 
 // ============================================================
+// Phantasmagoria dual-grain reverse reader
+// ============================================================
+// Dual-overlap triangular-window granular reverse reader over the rolling
+// interpolated main delay buffer. A grain phase ramps 0 -> 1; the read distance
+// behind the write pointer GROWS with phase, so playback walks from newer audio
+// toward older audio (the reverse feel). Two grains 180 degrees apart (phase and
+// phase + 0.5) are triangular-windowed and normalized by their window sum, which
+// keeps the reverse texture smooth and continuous instead of hard block reversal.
+struct ReverseGrainReader {
+  float phase = 0.0f;
+  float offset_ms = kReverseOffsetMs; // minimum read distance
+
+  void Init() {
+    phase = 0.0f;
+    offset_ms = kReverseOffsetMs;
+  }
+
+  inline float ReadDistance(float ph, float sr, float sweep_samps,
+                            float mod_samps) const {
+    return ph * sweep_samps + offset_ms * (sr / 1000.0f) + mod_samps;
+  }
+
+  // Advances one sample and returns the normalized dual-grain reverse sample.
+  // sweep_samps and freq_hz are supplied per sample: K2 sets the window length
+  // while freq_hz = kReverseSpeed / sweepSeconds keeps the read distance growing
+  // ~2 samples/sample, so reverse playback speed/pitch stays correct. The grain
+  // phase runs continuously and is never reset on K2 moves.
+  inline float Process(const DelBuf& src, float sr, float sweep_samps,
+                       float freq_hz, float mod_samps) {
+    phase += freq_hz / sr;
+    if (phase >= 1.0f) phase -= 1.0f;
+
+    const float pa = phase;
+    float pb = phase + 0.5f;
+    if (pb >= 1.0f) pb -= 1.0f;
+
+    // Triangular windows: 1 at grain center, 0 at the edges.
+    const float win_a = 1.0f - fabsf(2.0f * pa - 1.0f);
+    const float win_b = 1.0f - fabsf(2.0f * pb - 1.0f);
+
+    const float ga = src.Read(ReadDistance(pa, sr, sweep_samps, mod_samps));
+    const float gb = src.Read(ReadDistance(pb, sr, sweep_samps, mod_samps));
+
+    const float denom = fmaxf(win_a + win_b, 0.001f);
+    return (ga * win_a + gb * win_b) / denom;
+  }
+};
+
+// ============================================================
 // SDRAM storage and DSP objects
 // ============================================================
 static float DSY_SDRAM_BSS main_buf[kMaxDelay];
@@ -193,6 +274,9 @@ Lp1 filter_lp;    // parallel FILTER-layer band-pass: low-pass stage (K5)
 DelBuf rev_delay; // parallel SPACE-layer echo-chamber buffer (K6 / SW1 DOWN)
 Lp1 rev_lp;       // SPACE-layer input low-pass (pad-like)
 Hp1 rev_hp;       // SPACE-layer output high-pass (remove rumble)
+ReverseGrainReader reverse_reader;  // parallel REVERSE layer source (SW2 DIR)
+Lp1 reverse_lp;                     // gentle pad-friendly tone for reverse
+Lp1 reverse_smooth;                 // extra light pole softening reverse transients
 
 // Hardware state retained for later DSP milestones.
 Led led_freeze, led_effect;
@@ -225,6 +309,8 @@ Smoothed s_filter{0.0f, 0.0f, 0.0010f};        // K5 FILTER blend (0..1)
 Smoothed s_fx_gate{0.0f, 0.0f, 0.0015f};       // SW1 FX enable (click-free)
 Smoothed s_space{0.0f, 0.0f, 0.0010f};         // K6 SPACE blend (0..1)
 Smoothed s_space_gate{0.0f, 0.0f, 0.0015f};    // SW1 DOWN enable (click-free)
+Smoothed s_fwd_wet{1.0f, 1.0f, 0.0015f};       // SW2 DIR forward wet amount (click-free)
+Smoothed s_rev_wet{0.0f, 0.0f, 0.0015f};       // SW2 DIR reverse wet amount (click-free)
 
 // ============================================================
 // K2 TIME — pad-focused piecewise curve
@@ -289,6 +375,23 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
   s_space_gate.target =
       (toggle_positions[0] == Hothouse::TOGGLESWITCH_DOWN) ? 1.0f : 0.0f;
 
+  // SW2 DIR: separate forward/reverse wet amounts for the delay voice.
+  //   UP     = forward only.
+  //   MIDDLE = hybrid: forward clearly audible with reverse around it.
+  //   DOWN   = reverse-dominant: forward greatly reduced, reverse takes over.
+  // K1 dry and FS2 bypass are unaffected — only the WET delay voice changes.
+  float fwd_wet_target = kFwdWetUp;
+  float rev_wet_target = kRevWetUp;
+  if (toggle_positions[1] == Hothouse::TOGGLESWITCH_MIDDLE) {
+    fwd_wet_target = kFwdWetMid;
+    rev_wet_target = kRevWetMid;
+  } else if (toggle_positions[1] == Hothouse::TOGGLESWITCH_DOWN) {
+    fwd_wet_target = kFwdWetDown;
+    rev_wet_target = kRevWetDown;
+  }
+  s_fwd_wet.target = fwd_wet_target;
+  s_rev_wet.target = rev_wet_target;
+
   for (size_t i = 0; i < size; ++i) {
     const float dry = in[0][i];
 
@@ -306,10 +409,14 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
     s_fx_gate.Tick();
     s_space.Tick();
     s_space_gate.Tick();
+    s_fwd_wet.Tick();
+    s_rev_wet.Tick();
 
     // ----- Phantasmagoria-style custom DelBuf engine (clean core) -----
-    // Write dry + feedback; gently saturate the write when feedback is high
-    // so the loop compresses instead of running away.
+    // Write dry + feedback; gently saturate the write when feedback is high so
+    // the loop compresses instead of running away. The feedback source is the
+    // SW2 direction voice (computed below), so in reverse modes the delay bed
+    // itself becomes reverse-influenced rather than purely forward.
     float del_in = dry + fb_sig;
     if (s_feedback.current > 0.3f) {
       del_in = fast_tanh(del_in * 0.5f) * 2.0f;
@@ -322,35 +429,75 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
     float wet = main_delay.Read(read_pos);
     if (IsBad(wet)) wet = 0.0f;
 
-    // Clean delay path (fixed tone) — this is the core signal and the ONLY
-    // thing fed back, so the feedback loop is unaffected by the FX layer.
+    // Forward voice: fixed-tone, gently saturated forward read.
     const float wet_tone = tone_lpf.Process(wet);
-    fb_sig = wet_tone * s_feedback.current;
-    const float clean_layer = gentle_saturate(wet_tone);
+    const float forward_voice = gentle_saturate(wet_tone);
 
-    // ----- Parallel FILTER layer (SW1 + K5) -----
-    // Band-pass (high-pass -> low-pass) copy of the same delay read, with makeup
-    // gain, blended ALONGSIDE the clean delay for an obvious filtered-repeats
-    // texture. Filter state advances every sample (even when disabled) so there
-    // is no click when SW1 enables it. The clean delay always stays underneath.
-    const float band = filter_lp.Process(filter_hp.Process(wet));
+    // ----- Reverse voice (Phantasmagoria dual-grain reader) -----
+    // Reads the SAME rolling main delay buffer (Phantasmagoria dual-grain). K2
+    // sets the PERCEIVED reverse event length via the already-smoothed
+    // s_delay.current: the sweep spans ~2x that length of buffer history, and
+    // the grain rate is derived so the read distance always grows ~2
+    // samples/sample — reverse pitch/speed stays correct (no octaver) while K2
+    // changes how long the reverse bed feels. Sweep is clamped within the
+    // buffer; phase is never reset on K2 moves; s_delay is smoothed (zipper-free).
+    const float delay_ms = s_delay.current / (sample_rate / 1000.0f);
+    const float reverse_event_ms =
+        fclamp(delay_ms, kReverseEventMinMs, kReverseEventMaxMs);
+    float rev_sweep_samps =
+        reverse_event_ms * kReverseSpeed * (sample_rate / 1000.0f);
+    rev_sweep_samps =
+        fclamp(rev_sweep_samps, 1.0f, static_cast<float>(kMaxDelay) - 4.0f);
+    const float rev_freq_hz = kReverseSpeed * sample_rate / rev_sweep_samps;
+    float reverse_grain = reverse_reader.Process(main_delay, sample_rate,
+                                                 rev_sweep_samps, rev_freq_hz, 0.0f);
+    if (IsBad(reverse_grain)) reverse_grain = 0.0f;
+    const float reverse_soft =
+        reverse_smooth.Process(reverse_lp.Process(reverse_grain));
+    float reverse_voice = gentle_saturate(reverse_soft * kReverseMakeup);
+    if (IsBad(reverse_voice)) reverse_voice = 0.0f;
+
+    // ----- SW2 DIRECTION voice: the main wet delay voice -----
+    // SW2 selects the wet delay WORLD, not just an added layer:
+    //   UP     = forward only          (fwd 1.0  / rev 0.0)
+    //   MIDDLE = hybrid forward+reverse (fwd 0.75 / rev 0.45)
+    //   DOWN   = reverse only           (fwd 0.0  / rev 1.0)
+    // The filter, space, and feedback all derive from this voice.
+    const float direction_voice =
+        forward_voice * s_fwd_wet.current + reverse_voice * s_rev_wet.current;
+
+    // Feedback follows the direction voice. Uses the pre-saturation toned
+    // signals (wet_tone / reverse_soft) so SW2 UP reproduces the original
+    // forward feedback exactly, while SW2 DOWN feeds the reverse voice back into
+    // the delay bed for cohesion. No second tone filter needed.
+    float fb_source =
+        wet_tone * s_fwd_wet.current + reverse_soft * s_rev_wet.current;
+    fb_sig = fb_source * s_feedback.current;
+    if (IsBad(fb_sig)) fb_sig = 0.0f;
+
+    // ----- Parallel FILTER layer (SW1 + K5), fed from the DIRECTION voice -----
+    // Band-pass (high-pass -> low-pass) of the SELECTED direction voice, with
+    // makeup gain, blended alongside it. So the filter follows SW2: forward
+    // repeats in UP, hybrid in MIDDLE, reverse repeats in DOWN. Filter state
+    // advances every sample so SW1 enabling is click-free.
+    const float band = filter_lp.Process(filter_hp.Process(direction_voice));
     float filtered_layer = gentle_saturate(band * kFilterMakeup);
     // Mild extra saturation so the louder filtered layer stays smooth, not harsh.
     filtered_layer = gentle_saturate(filtered_layer * 1.2f);
     // K5 curve so the filtered layer enters faster (25% already clearly filtered).
     const float gate = fclamp(s_fx_gate.current * s_filter.current, 0.0f, 1.0f);
     const float f = powf(gate, 0.65f);
-    // Clean tapers down to kFilterCleanFloor; filtered layer is ADDED so K5 is
-    // mostly a "how much filtered layer" control and dominates at max.
+    // Direction voice tapers to kFilterCleanFloor; filtered layer is ADDED so K5
+    // is mostly a "how much filtered layer" control and dominates at max.
     const float clean_gain = 1.0f - (1.0f - kFilterCleanFloor) * f;
-    const float delay_out = clean_layer * clean_gain + filtered_layer * f;
+    const float delay_out = direction_voice * clean_gain + filtered_layer * f;
 
-    // ----- Parallel SPACE layer (SW1 DOWN + K6) -----
-    // Lightweight multi-tap echo-chamber reverb fed from the delay layer. It
-    // runs every sample (state stays continuous so SW1 DOWN is click-free) but
-    // is only ADDED to the output when SW1 == DOWN, scaled by K6. Its own
-    // feedback (rev_fb) is separate from the clean delay loop, so the core
-    // delay is unaffected.
+    // ----- Parallel SPACE layer (SW1 DOWN + K6), fed from delay_out -----
+    // Fed from the direction + filter voice, so SW2 DOWN + SW1 DOWN is genuine
+    // reverse-space (not forward-space with reverse pasted on top). Runs every
+    // sample (continuous state so SW1 DOWN is click-free) but is only ADDED to
+    // the output when SW1 == DOWN, scaled by K6. Its own feedback (rev_fb) is
+    // separate from the main delay loop.
     float rev_in = rev_lp.Process(delay_out + rev_fb * kRevFeedback);
     if (IsBad(rev_in)) rev_in = 0.0f;
     rev_delay.Write(rev_in);
@@ -399,6 +546,9 @@ int main() {
   rev_delay.Init(rev_buf, kRevSize);
   rev_lp.Init(kRevLpHz, sample_rate);
   rev_hp.Init(kRevHpHz, sample_rate);
+  reverse_reader.Init();
+  reverse_lp.Init(kReverseToneHz, sample_rate);
+  reverse_smooth.Init(kReverseSmoothHz, sample_rate);
 
   led_freeze.Init(hw.seed.GetPin(Hothouse::LED_1), false);
   led_effect.Init(hw.seed.GetPin(Hothouse::LED_2), false);
