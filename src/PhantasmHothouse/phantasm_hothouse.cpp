@@ -214,7 +214,7 @@ struct DelBuf {
 // ============================================================
 // Phantasmagoria dual-grain reverse reader
 // ============================================================
-// Dual-overlap triangular-window granular reverse reader over the rolling
+// Dual-overlap Hann-window granular reverse reader over the rolling
 // interpolated main delay buffer. A grain phase ramps 0 -> 1; the read distance
 // behind the write pointer GROWS with phase, so playback walks from newer audio
 // toward older audio (the reverse feel). Two grains 180 degrees apart (phase and
