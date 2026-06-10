@@ -541,6 +541,60 @@ In SW2 DOWN, the wet delay/space layer should be mostly or fully reverse. This m
 
 K1 MIX may still pass dry input normally, but the effected wet voice should be reverse-dominant.
 
+## Hold / Freeze Definition
+
+FS1 is a toggle control, not a momentary hold control.
+
+FS1 behavior:
+- Tap once = turn hold/freeze ON
+- Tap again = turn hold/freeze OFF
+
+LED1 shows the hold/freeze state:
+- LED1 off = hold inactive
+- LED1 on = hold active
+
+K4 HOLD controls the level of the held/frozen bed.
+
+Hold should create a sustained musical bed from the pedal's current wet texture. It should feel like freezing a delay/space bed, not like triggering a glitch sampler.
+
+Hold should not require the user to keep FS1 pressed.
+
+Hold should be a separate sustained layer blended with the live pedal sound. It should not automatically replace the live delay path unless a future SW3 mode explicitly does that.
+
+The player should be able to:
+- build a delay/filter/space/reverse texture
+- tap FS1 to freeze or hold that bed
+- keep playing over it
+- control the held bed level with K4 HOLD
+- tap FS1 again to release/turn off the held bed
+
+Capture source:
+Hold should capture the current wet instrument bed, not the dry input alone.
+
+That means:
+- SW1 UP captures clean delay
+- SW1 MIDDLE captures filtered delay
+- SW1 DOWN captures filter + space
+- SW2 DOWN captures reverse or reverse-space behavior
+
+SW3 HOLD will define the behavior later:
+
+SW3 UP = Pure Hold
+The held bed stays stable and does not absorb new live input.
+
+SW3 MIDDLE = Live Delay Over Hold
+The held bed continues while live delay plays over it.
+
+SW3 DOWN = Absorb / Bleed
+New live material slowly enters the held bed.
+
+Do not implement all SW3 modes at once. For the first hold milestone, implement only a stable basic hold foundation:
+- FS1 toggles hold on/off
+- K4 controls held bed level
+- LED1 shows hold state
+- no absorb/bleed yet
+- no complex evolution yet
+
 ## Project separation
 
 Do not confuse PhantasmHothouse with MoonChild or Flux Apparition.
