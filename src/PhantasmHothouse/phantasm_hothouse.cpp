@@ -76,12 +76,10 @@ static constexpr float kMaxFeedback = 0.78f;
 
 // FREEZE feedback gain: near-unity recirculation of the existing delay memory.
 // Kept just below 1.0 and combined with the soft-clip below so the held buffer
-// sustains without runaway. 0.98 dissipated too fast; 0.995 holds far longer.
-// TODO(freeze sustain): if the held bed still smears/darkens over time (the
-// feedback source is always wet_tone, so it re-filters each pass), add a
-// freeze-specific recirculation path that preserves the held delay memory more
-// faithfully while still avoiding runaway. Do NOT redesign this in v0.6.1a.
-static constexpr float kFreezeFeedback = 0.995f;
+// sustains without runaway. v0.6.2b latches an INTEGER loop length and reads it
+// without interpolation (DelBuf::ReadInt), removing per-lap smear, so the gain
+// can sit at 0.999 for very long, stable chord holds. Do NOT use 1.0f.
+static constexpr float kFreezeFeedback = 0.999f;
 
 // Asymmetric freeze ramp: engage is reasonably quick; release is slow so the
 // frozen bed melts gradually back into the normal delay instead of decaying in
@@ -233,6 +231,16 @@ struct DelBuf {
     float b = buf[(i0 + 1) % len];
     return a * (1.0f - fr) + b * fr;
   }
+
+  // Non-interpolating read at an integer sample distance behind the write head.
+  // Used for the latched freeze loop so recirculation does not accumulate the
+  // per-lap interpolation smear that fractional Read() introduces.
+  inline float ReadInt(size_t samps) const {
+    if (samps < 1) samps = 1;
+    if (samps > len - 1) samps = len - 1;
+    size_t r = (wp + len - samps) % len;  // wp - samps, wrapped
+    return buf[r];
+  }
 };
 
 // ============================================================
@@ -323,6 +331,7 @@ float fb_sig = 0.0f;
 float rev_fb = 0.0f;  // SPACE-layer reverb feedback (separate from clean loop)
 float live_write_gain = 1.0f;       // dry-input write gate (Pure Hold With Grace)
 float live_grace_remain = 0.0f;     // grace countdown in samples (audio thread only)
+size_t freeze_loop_samps = 2400;    // latched integer freeze loop length (audio thread only)
 
 // ============================================================
 // Smoothed parameters
@@ -392,6 +401,11 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
     if (freeze_active) {
       // Start the live-input grace window: dry keeps writing this long, then fades.
       live_grace_remain = kLiveGraceMs * (sample_rate / 1000.0f);
+      // Latch an INTEGER loop length so the frozen forward bed/feedback can't
+      // wander (K2) or smear (fractional interpolation) while held.
+      freeze_loop_samps = static_cast<size_t>(
+          lroundf(fclamp(s_delay.current, 1.0f,
+                         static_cast<float>(kMaxDelay) - 2.0f)));
     } else {
       live_grace_remain = 0.0f;
     }
@@ -514,6 +528,15 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
     const float read_pos =
         fclamp(s_delay.current, 1.0f, static_cast<float>(kMaxDelay) - 2.0f);
     float wet = main_delay.Read(read_pos);
+    // FREEZE LOOP LOCK (v0.6.2b): while freeze is active, crossfade the audible
+    // forward read toward the latched integer loop read so the held forward bed
+    // is fully static (K2-independent, no fractional smear). At engage the latched
+    // length matches read_pos, so the crossfade is seamless; when not frozen this
+    // is exactly main_delay.Read(read_pos).
+    if (s_freeze.current > 0.0005f) {
+      const float wet_frozen = main_delay.ReadInt(freeze_loop_samps);
+      wet = wet * (1.0f - s_freeze.current) + wet_frozen * s_freeze.current;
+    }
     if (IsBad(wet)) wet = 0.0f;
 
     // Forward voice: fixed-tone, gently saturated forward read.
@@ -565,7 +588,9 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
     //               cumulative darkening/smearing). Still clean-forward only;
     //               reverse / direction / filter / space are never fed back.
     const float normal_fb = wet_tone * s_feedback.current;
-    const float freeze_fb = wet * kFreezeFeedback;
+    // Freeze recirculates the latched INTEGER loop (no interpolation, no wander),
+    // consistent with the audible frozen forward read above. Raw read (not toned).
+    const float freeze_fb = main_delay.ReadInt(freeze_loop_samps) * kFreezeFeedback;
     fb_sig = normal_fb * (1.0f - s_freeze.current) + freeze_fb * s_freeze.current;
     if (IsBad(fb_sig)) fb_sig = 0.0f;
 
