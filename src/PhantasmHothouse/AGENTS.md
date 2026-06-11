@@ -595,6 +595,38 @@ Do not implement all SW3 modes at once. For the first hold milestone, implement 
 - no absorb/bleed yet
 - no complex evolution yet
 
+### Freeze implementation notes (current state)
+
+The shipped freeze is a TRUE delay-line freeze, not a separate hold buffer:
+- FS1 toggles freeze on the main delay line itself.
+- On freeze, live dry is faded out of the delay write and the feedback gain ramps
+  to near-unity (`kFreezeFeedback`), so the existing delay memory recirculates.
+- Freeze feedback recirculates from the RAW forward read (`wet`), not the toned
+  feedback path, to reduce cumulative darkening/smear (v0.6.1b).
+- Engage/release smoothing is asymmetric: quick engage, slow (~2 s) graceful melt
+  on release (v0.6.1c).
+- K4 is a center-unity freeze level trim (min ~off, noon = unity, max = ~1.5x).
+- No `hold_buf`, no `delay_plus_space` capture layer, no sampler-style freeze.
+
+### Known freeze edge cases / future TODO (do NOT fix yet)
+
+1. Freeze engage tremolo (rare, hard to reproduce):
+   - If freeze is armed at a very precise moment, the frozen bed can occasionally
+     sound like a tremolo. Likely cause: engage catches the feedback loop at an
+     unlucky phase/peak/dip/beating point, preserving an amplitude modulation.
+   - REJECTED fix: moving look-back read during engage (v0.6.2). It changed the
+     feedback tap from `read_pos + lookback` back to `read_pos` over the engage
+     window, behaving like a moving delay tap and producing pitch warble. DO NOT
+     reintroduce a moving read point.
+   - Allowed future directions only: very gentle freeze engage gain ramp, a
+     transient/peak guard, or phase/level-safe freeze arming.
+   - Hard constraints for any future fix: no pitch movement, no tone suck, no
+     permanent compression, no permanent filtering, no moving read point, no
+     separate hold buffer.
+
+2. Very long holds:
+   - Multi-minute freezes may eventually fade or muddy. Known, not a blocker.
+
 ## Project separation
 
 Do not confuse PhantasmHothouse with MoonChild or Flux Apparition.
