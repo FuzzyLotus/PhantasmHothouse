@@ -83,6 +83,20 @@ static constexpr float kMaxFeedback = 0.78f;
 // faithfully while still avoiding runaway. Do NOT redesign this in v0.6.1a.
 static constexpr float kFreezeFeedback = 0.995f;
 
+// Asymmetric freeze ramp: engage is reasonably quick; release is slow so the
+// frozen bed melts gradually back into the normal delay instead of decaying in
+// stepped chunks. (fonepole coeff -> ~1/(coeff*fs) time constant at 48 kHz.)
+static constexpr float kFreezeEngageCoeff = 0.0010f;    // ~80 ms engage
+static constexpr float kFreezeReleaseCoeff = 0.00004f;  // ~2 s graceful melt
+
+// FREEZE live-input write gate (v0.6.2a "Pure Hold With Grace"): decoupled from
+// s_freeze. When freeze engages, dry input keeps writing into the delay for a
+// short grace window (so the chord isn't chopped), then fades out so playing over
+// a freeze doesn't endlessly stack into the near-unity loop. main_delay.Write()
+// still runs every sample (it always writes the feedback signal).
+static constexpr float kLiveGraceMs = 220.0f;           // dry stays in this long after engage
+static constexpr float kLiveWriteFadeCoeff = 0.00015f;  // ~150 ms smooth live-input fade
+
 // Fixed tone of the clean delay / feedback path (was K5-driven before v0.3).
 static constexpr float kFeedbackToneHz = 8000.0f;
 
@@ -307,6 +321,8 @@ Hothouse::ToggleswitchPosition toggle_positions[3] = {
 float sample_rate = 48000.0f;
 float fb_sig = 0.0f;
 float rev_fb = 0.0f;  // SPACE-layer reverb feedback (separate from clean loop)
+float live_write_gain = 1.0f;       // dry-input write gate (Pure Hold With Grace)
+float live_grace_remain = 0.0f;     // grace countdown in samples (audio thread only)
 
 // ============================================================
 // Smoothed parameters
@@ -373,6 +389,12 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
   // FS1 is a toggle (not momentary): tap to freeze/unfreeze the main delay line.
   if (hw.switches[Hothouse::FOOTSWITCH_1].RisingEdge()) {
     freeze_active = !freeze_active;
+    if (freeze_active) {
+      // Start the live-input grace window: dry keeps writing this long, then fades.
+      live_grace_remain = kLiveGraceMs * (sample_rate / 1000.0f);
+    } else {
+      live_grace_remain = 0.0f;
+    }
   }
   fs1_held = hw.switches[Hothouse::FOOTSWITCH_1].Pressed();
   fs2_held = hw.switches[Hothouse::FOOTSWITCH_2].Pressed();
@@ -440,7 +462,31 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
     s_fwd_wet.Tick();
     s_rev_wet.Tick();
     s_freeze_level.Tick();
-    s_freeze.Tick();
+    // Asymmetric freeze smoothing: quick engage toward 1.0, slow melt toward 0.0
+    // so turning freeze OFF lets the bed decay gracefully rather than in steps.
+    {
+      const float freeze_coeff = (s_freeze.target > s_freeze.current)
+                                     ? kFreezeEngageCoeff
+                                     : kFreezeReleaseCoeff;
+      fonepole(s_freeze.current, s_freeze.target, freeze_coeff);
+    }
+
+    // Live-input write gate (Pure Hold With Grace), DECOUPLED from s_freeze.
+    // s_freeze still drives feedback ramp/crossfade and wet scaling; this only
+    // controls whether new dry input enters the delay memory. On freeze ON the
+    // dry keeps writing through a short grace window (chord not chopped) then
+    // fades to 0 (so playing over the freeze doesn't endlessly stack). On freeze
+    // OFF it returns to 1.0 so normal playing writes fully again.
+    float live_write_target;
+    if (!freeze_active) {
+      live_write_target = 1.0f;
+    } else if (live_grace_remain > 0.0f) {
+      live_write_target = 1.0f;
+      live_grace_remain -= 1.0f;
+    } else {
+      live_write_target = 0.0f;
+    }
+    fonepole(live_write_gain, live_write_target, kLiveWriteFadeCoeff);
 
     // ----- Phantasmagoria-style custom DelBuf engine (clean core) -----
     // Write (gated dry) + feedback; gently saturate the write when feedback is
@@ -448,12 +494,11 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
     // on the clean forward path only; feeding reverse back into this same rolling
     // buffer gets reversed again on later passes and turns forward-ish.
     //
-    // FREEZE (FS1): as s_freeze ramps to 1.0 the live dry input is faded OUT of
-    // the delay write and fb_sig switches to near-unity recirculation (computed
-    // below), so the EXISTING delay memory is held and keeps circulating through
-    // the normal wet path. This holds the delay line itself rather than playing a
-    // separate sampler loop on top.
-    float del_in = dry * (1.0f - s_freeze.current) + fb_sig;
+    // FREEZE (FS1): fb_sig switches to near-unity recirculation (computed below)
+    // as s_freeze ramps to 1.0, so the EXISTING delay memory is held and keeps
+    // circulating through the normal wet path. live_write_gain (above) decides how
+    // much new dry input is allowed in. main_delay.Write() runs every sample.
+    float del_in = dry * live_write_gain + fb_sig;
     if (s_freeze.current > 0.3f) {
       // Frozen: only limit on genuine overshoot so the held memory isn't
       // softly compressed/darkened on every recirculation pass.
@@ -463,7 +508,7 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
     } else if (s_feedback.current > 0.3f) {
       del_in = fast_tanh(del_in * 0.5f) * 2.0f;
     }
-    if (IsBad(del_in)) del_in = dry * (1.0f - s_freeze.current);
+    if (IsBad(del_in)) del_in = dry * live_write_gain;
     main_delay.Write(del_in);
 
     const float read_pos =
