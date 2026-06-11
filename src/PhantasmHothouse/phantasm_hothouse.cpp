@@ -22,7 +22,7 @@
 //   K2 TIME    Delay time, pad-focused.
 //   K3 SUSTAIN Feedback / buildup.
 // Bottom row knobs (performance layers):
-//   K4 HOLD    Held bed level.                  (not implemented yet)
+//   K4 HOLD    Frozen wet level.                (v0.6: scales wet while frozen)
 //   K5 FILTER  Filtered repeats blend.          (v0.3.1: parallel band-pass layer)
 //   K6 SPACE   Reverb / space blend.            (v0.4: parallel reverb layer, SW1 DOWN)
 // Switch row (mode / world selectors):
@@ -30,8 +30,8 @@
 //   SW2 DIR    UP forward / MID hybrid / DOWN reverse.  (v0.5: dual-grain reverse)
 //   SW3 HOLD   UP pure hold / MID live-over-hold / DOWN absorb-bleed. (unused)
 // Footswitches:
-//   FS1 HOLD   Hold/freeze performance control. (placeholder: LED1 only)
-//   FS2 BYPASS Effect on/off.
+//   FS1 HOLD   Freeze delay line toggle.        (v0.6: tap on / tap off)
+//   FS2 BYPASS Effect on/off.  (FS1+FS2 held ~3 s = bootloader)
 // LEDs:
 //   LED1 HOLD   Hold/freeze status.
 //   LED2 EFFECT Bypass/engaged status.
@@ -54,6 +54,7 @@ using clevelandmusicco::Hothouse;
 using daisy::AudioHandle;
 using daisy::Led;
 using daisy::SaiHandle;
+using daisy::System;
 using daisysp::fclamp;
 using daisysp::fonepole;
 
@@ -72,6 +73,15 @@ static constexpr float kTimeMinMs = 20.0f;
 static constexpr float kTimeMaxMs = 1800.0f;
 
 static constexpr float kMaxFeedback = 0.78f;
+
+// FREEZE feedback gain: near-unity recirculation of the existing delay memory.
+// Kept just below 1.0 and combined with the soft-clip below so the held buffer
+// sustains without runaway. 0.98 dissipated too fast; 0.995 holds far longer.
+// TODO(freeze sustain): if the held bed still smears/darkens over time (the
+// feedback source is always wet_tone, so it re-filters each pass), add a
+// freeze-specific recirculation path that preserves the held delay memory more
+// faithfully while still avoiding runaway. Do NOT redesign this in v0.6.1a.
+static constexpr float kFreezeFeedback = 0.995f;
 
 // Fixed tone of the clean delay / feedback path (was K5-driven before v0.3).
 static constexpr float kFeedbackToneHz = 8000.0f;
@@ -287,6 +297,8 @@ Led led_freeze, led_effect;
 // Written in AudioCallback, read in main — volatile for cross-context visibility.
 volatile bool bypass = true;
 volatile bool fs1_held = false;
+volatile bool fs2_held = false;
+volatile bool freeze_active = false;  // FS1 toggle: freeze the main delay line
 float knob_values[Hothouse::KNOB_LAST] = {};
 Hothouse::ToggleswitchPosition toggle_positions[3] = {
     Hothouse::TOGGLESWITCH_UNKNOWN, Hothouse::TOGGLESWITCH_UNKNOWN,
@@ -315,6 +327,8 @@ Smoothed s_space{0.0f, 0.0f, 0.0010f};         // K6 SPACE blend (0..1)
 Smoothed s_space_gate{0.0f, 0.0f, 0.0015f};    // SW1 DOWN enable (click-free)
 Smoothed s_fwd_wet{1.0f, 1.0f, 0.0015f};       // SW2 DIR forward wet amount (click-free)
 Smoothed s_rev_wet{0.0f, 0.0f, 0.0015f};       // SW2 DIR reverse wet amount (click-free)
+Smoothed s_freeze_level{1.0f, 1.0f, 0.0010f};  // K4 HOLD frozen wet level
+Smoothed s_freeze{0.0f, 0.0f, 0.0010f};        // freeze engage/disengage (click-free, 0..1)
 
 // ============================================================
 // K2 TIME — pad-focused piecewise curve
@@ -356,7 +370,12 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
   if (hw.switches[Hothouse::FOOTSWITCH_2].RisingEdge()) {
     bypass = !bypass;
   }
+  // FS1 is a toggle (not momentary): tap to freeze/unfreeze the main delay line.
+  if (hw.switches[Hothouse::FOOTSWITCH_1].RisingEdge()) {
+    freeze_active = !freeze_active;
+  }
   fs1_held = hw.switches[Hothouse::FOOTSWITCH_1].Pressed();
+  fs2_held = hw.switches[Hothouse::FOOTSWITCH_2].Pressed();
 
   for (size_t i = 0; i < Hothouse::KNOB_LAST; ++i) {
     knob_values[i] = hw.GetKnobValue(static_cast<Hothouse::Knob>(i));
@@ -396,6 +415,11 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
   s_fwd_wet.target = fwd_wet_target;
   s_rev_wet.target = rev_wet_target;
 
+  // FREEZE: s_freeze ramps the delay write/feedback path into held recirculation;
+  // K4 sets the frozen wet level applied while freeze is engaged.
+  s_freeze_level.target = fclamp(knob_values[Hothouse::KNOB_4], 0.0f, 1.0f);
+  s_freeze.target = freeze_active ? 1.0f : 0.0f;
+
   for (size_t i = 0; i < size; ++i) {
     const float dry = in[0][i];
 
@@ -415,17 +439,31 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
     s_space_gate.Tick();
     s_fwd_wet.Tick();
     s_rev_wet.Tick();
+    s_freeze_level.Tick();
+    s_freeze.Tick();
 
     // ----- Phantasmagoria-style custom DelBuf engine (clean core) -----
-    // Write dry + feedback; gently saturate the write when feedback is high so
-    // the loop compresses instead of running away. Feedback stays based on the
-    // clean forward path only; feeding reverse back into this same rolling buffer
-    // gets reversed again on later passes and turns forward-ish.
-    float del_in = dry + fb_sig;
-    if (s_feedback.current > 0.3f) {
+    // Write (gated dry) + feedback; gently saturate the write when feedback is
+    // high so the loop compresses instead of running away. Feedback stays based
+    // on the clean forward path only; feeding reverse back into this same rolling
+    // buffer gets reversed again on later passes and turns forward-ish.
+    //
+    // FREEZE (FS1): as s_freeze ramps to 1.0 the live dry input is faded OUT of
+    // the delay write and fb_sig switches to near-unity recirculation (computed
+    // below), so the EXISTING delay memory is held and keeps circulating through
+    // the normal wet path. This holds the delay line itself rather than playing a
+    // separate sampler loop on top.
+    float del_in = dry * (1.0f - s_freeze.current) + fb_sig;
+    if (s_freeze.current > 0.3f) {
+      // Frozen: only limit on genuine overshoot so the held memory isn't
+      // softly compressed/darkened on every recirculation pass.
+      if (fabsf(del_in) > 1.2f) {
+        del_in = fast_tanh(del_in * 0.5f) * 2.0f;
+      }
+    } else if (s_feedback.current > 0.3f) {
       del_in = fast_tanh(del_in * 0.5f) * 2.0f;
     }
-    if (IsBad(del_in)) del_in = dry;
+    if (IsBad(del_in)) del_in = dry * (1.0f - s_freeze.current);
     main_delay.Write(del_in);
 
     const float read_pos =
@@ -474,7 +512,16 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
     // Main delay feedback remains clean-forward in all SW2 modes. The audible
     // wet voice can be reverse-only, but the rolling buffer should not contain
     // reverse-fed repeats that get reversed again on the next pass.
-    fb_sig = wet_tone * s_feedback.current;
+    //
+    // Two feedback sources, crossfaded by s_freeze (click-free):
+    //   normal_fb = wet_tone * K3  -> the v0.5 toned feedback (unchanged when off)
+    //   freeze_fb = wet * near-unity -> RAW forward read, so the frozen memory
+    //               recirculates without re-applying tone_lpf every pass (less
+    //               cumulative darkening/smearing). Still clean-forward only;
+    //               reverse / direction / filter / space are never fed back.
+    const float normal_fb = wet_tone * s_feedback.current;
+    const float freeze_fb = wet * kFreezeFeedback;
+    fb_sig = normal_fb * (1.0f - s_freeze.current) + freeze_fb * s_freeze.current;
     if (IsBad(fb_sig)) fb_sig = 0.0f;
 
     // ----- Parallel FILTER layer (SW1 + K5), fed from the DIRECTION voice -----
@@ -515,6 +562,25 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
     const float sp = fclamp(s_space_gate.current * s_space.current, 0.0f, 1.0f);
     const float delay_plus_space = delay_out + space_layer * (kSpaceLevel * sp);
 
+    // K4 HOLD is a center-unity freeze level trim applied to the wet delay voice
+    // only while freeze is engaged. K4 min = mostly off, K4 noon = unity (same as
+    // normal wet), K4 max = modest boost (1.5x). When not frozen (s_freeze == 0)
+    // the scale is exactly 1.0, so the v0.5 wet path is unchanged. This is NOT a
+    // separate buffer/layer — it just rides the level of the (now held) main
+    // delay line's wet output.
+    // TODO(v0.6.2): add a smoother freeze engage crossfade similar to
+    // Phantasmagoria, especially for hard chord strikes — the current freeze
+    // works but engage can feel abrupt when freezing a chord.
+    const float k4 = s_freeze_level.current;
+    float freeze_level = 1.0f;
+    if (k4 < 0.5f) {
+      freeze_level = k4 * 2.0f;          // 0.0 -> 1.0 over the lower half
+    } else {
+      freeze_level = 1.0f + (k4 - 0.5f); // 1.0 -> 1.5 over the upper half
+    }
+    const float freeze_wet_scale =
+        1.0f + (freeze_level - 1.0f) * s_freeze.current;
+
     // Constant-power dry/wet mix; pure dry at K1 minimum.
     float out_mono;
     if (s_mix.current <= 0.0005f) {
@@ -523,7 +589,7 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
       float dry_gain = 1.0f;
       float wet_gain = 0.0f;
       EqualPowerGains(s_mix.current, &dry_gain, &wet_gain);
-      out_mono = dry * dry_gain + delay_plus_space * wet_gain;
+      out_mono = dry * dry_gain + delay_plus_space * (wet_gain * freeze_wet_scale);
     }
 
     if (IsBad(out_mono)) out_mono = dry;
@@ -558,17 +624,53 @@ int main() {
   hw.StartAdc();
   hw.StartAudio(AudioCallback);
 
+  // Bootloader/DFU entry: BOTH footswitches held together for ~3 s. FS1 alone
+  // must never enter the bootloader (it is the HOLD performance control).
+  bool dfu_combo_active = false;
+  bool dfu_combo_triggered = false;
+  uint32_t dfu_combo_start_ms = 0;
+
   while (true) {
     hw.DelayMs(10);
 
-    // LEDs updated at ~100 Hz, not audio rate.
-    led_freeze.Set(fs1_held ? 1.0f : 0.0f);
-    led_effect.Set(bypass ? 0.0f : 1.0f);
+    const bool combo_held = fs1_held && fs2_held;
+
+    // FS1 + FS2 held together for ~3 s enters the bootloader.
+    if (combo_held && !dfu_combo_triggered) {
+      if (!dfu_combo_active) {
+        dfu_combo_active = true;
+        dfu_combo_start_ms = System::GetNow();
+      } else if (System::GetNow() - dfu_combo_start_ms >= 3000) {
+        dfu_combo_triggered = true;
+        // Both LEDs solid ON just before the jump, as a final confirmation.
+        led_freeze.Set(1.0f);
+        led_effect.Set(1.0f);
+        led_freeze.Update();
+        led_effect.Update();
+        System::ResetToBootloader();
+      }
+    } else if (!combo_held) {
+      dfu_combo_active = false;
+      dfu_combo_start_ms = 0;
+    }
+
+    // LEDs: while the combo is held, override normal behavior and blink BOTH
+    // LEDs together (slow before 2 s, faster after) as bootloader-arm feedback.
+    // Releasing either switch before 3 s returns to normal LED behavior.
+    if (dfu_combo_active && !dfu_combo_triggered) {
+      const uint32_t elapsed = System::GetNow() - dfu_combo_start_ms;
+      const uint32_t blink_ms = (elapsed >= 2000) ? 80 : 200;
+      const bool blink_on = ((System::GetNow() / blink_ms) & 1u) != 0u;
+      const float lvl = blink_on ? 1.0f : 0.0f;
+      led_freeze.Set(lvl);
+      led_effect.Set(lvl);
+    } else {
+      // Normal: LED1 follows freeze, LED2 follows bypass. (~100 Hz, not audio.)
+      led_freeze.Set(freeze_active ? 1.0f : 0.0f);
+      led_effect.Set(bypass ? 0.0f : 1.0f);
+    }
     led_freeze.Update();
     led_effect.Update();
-
-    // Call System::ResetToBootloader() if FOOTSWITCH_1 is pressed for 2 seconds
-    hw.CheckResetToBootloader();
   }
   return 0;
 }
