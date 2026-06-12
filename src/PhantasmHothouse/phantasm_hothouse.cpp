@@ -36,10 +36,14 @@
 //   LED1 HOLD   Hold/freeze status.
 //   LED2 EFFECT Bypass/engaged status.
 //
-// DSP architecture: the clean delay (top row) is the core signal. Filter,
-// space/reverb, reverse, and hold are optional PARALLEL layers blended around
-// the clean delay (bottom row + switches); they never permanently replace it.
-// Only the clean delay + tone exist so far.
+// DSP architecture: the clean delay (top row) is the CORE MEMORY. Filter,
+// space/reverb, and reverse are renderers/layers around that memory (bottom row
+// + switches); they never permanently replace the clean delay.
+// HOLD / FREEZE is NOT a detached parallel layer and NOT a separate output
+// looper / hold buffer. It is a delay-memory STATE: when engaged it changes the
+// main delay write/feedback behavior (live input stops entering the line, the
+// existing memory recirculates near unity) and the held memory is still rendered
+// through the same wet path (direction / filter / space) as the live delay.
 
 // ### Uncomment if IntelliSense can't resolve DaisySP-LGPL classes ###
 // #include "daisysp-lgpl.h"
@@ -95,6 +99,15 @@ static constexpr float kFreezeReleaseCoeff = 0.00004f;  // ~2 s graceful melt
 static constexpr float kLiveGraceMs = 220.0f;           // dry stays in this long after engage
 static constexpr float kLiveWriteFadeCoeff = 0.00015f;  // ~150 ms smooth live-input fade
 
+// FREEZE diffusion mask (v0.6.2d): a tiny freeze-ONLY audible allpass diffuser
+// mixed in very low to soften loop-seam perception. Output-only — never written
+// to the main delay, never in any feedback path. Amount = mix * s_freeze^2, so it
+// is exactly 0 when not frozen and tops out at kFreezeDiffusionMix when fully held.
+static constexpr size_t kFreezeDiffSize = 2048;     // small allpass buffer (~42 ms max)
+static constexpr size_t kFreezeDiffDelay = 811;     // ~16.9 ms at 48 kHz
+static constexpr float kFreezeDiffGain = 0.55f;     // allpass coefficient (stable, < 1.0)
+static constexpr float kFreezeDiffusionMix = 0.05f; // max audible mask blend (5%)
+
 // Fixed tone of the clean delay / feedback path (was K5-driven before v0.3).
 static constexpr float kFeedbackToneHz = 8000.0f;
 
@@ -140,13 +153,21 @@ static constexpr float kReverseEventMaxMs = 1900.0f;  // longest perceived rever
 static constexpr float kReverseToneHz = 5500.0f;    // main reverse low-pass (conservative)
 static constexpr float kReverseSmoothHz = 6000.0f;  // extra light transient softener
 static constexpr float kReverseMakeup = 1.2f;       // keep reverse present, not smeared
+// Hybrid low-end preservation: when forward AND reverse are summed (SW2 MIDDLE),
+// the phase-decorrelated reverse combs/cancels the forward bass (perceived as
+// low-end loss). High-pass the reverse CONTRIBUTION in proportion to how much
+// forward is present, so the coherent forward voice keeps the low end. In SW2
+// DOWN (forward absent) the reverse is full-range and untouched.
+static constexpr float kReverseSumHpHz = 190.0f;    // gentle one-pole HP on summed reverse
 // SW2 DIR selects the wet delay VOICE (forward / hybrid / reverse). The same
-// amounts drive the direction voice, the filter source, the space source, and
-// the feedback source, so reverse stays glued to the delay bed.
+// amounts drive the direction voice, the filter source, and the space source.
+// The main delay feedback source is intentionally NOT driven by these amounts —
+// it stays clean-forward (wet_tone) so reverse never feeds the delay loop.
 static constexpr float kFwdWetUp = 1.0f;     // UP: forward only
 static constexpr float kRevWetUp = 0.0f;
-static constexpr float kFwdWetMid = 0.75f;   // MIDDLE: forward clearly present...
-static constexpr float kRevWetMid = 0.45f;   //         ...with reverse blooming around it
+static constexpr float kFwdWetMid = 0.80f;   // MIDDLE: forward clearly present...
+static constexpr float kRevWetMid = 0.48f;   //         ...with reverse blooming around it
+                                             //  (~6-7% bump vs 0.75/0.45 to match UP/DOWN level)
 static constexpr float kFwdWetDown = 0.0f;   // DOWN: reverse only in the wet voice
 static constexpr float kRevWetDown = 1.0f;   //       reverse only
 
@@ -244,6 +265,38 @@ struct DelBuf {
 };
 
 // ============================================================
+// Schroeder allpass diffuser (stable, phase-only)
+// ============================================================
+// Standard single allpass: y = -g*x + d + g*y_delayed, where d is the delayed
+// buffer sample. Flat magnitude response (no intentional tone change), it only
+// diffuses phase. Used freeze-only as a very low-mix mask. Gain must stay < 1.0.
+struct Allpass {
+  float* buf = nullptr;
+  size_t len = 0;
+  size_t wp = 0;
+  size_t delay = 1;
+  float g = 0.5f;
+
+  void Init(float* mem, size_t n, size_t delay_samps, float gain) {
+    buf = mem;
+    len = n;
+    wp = 0;
+    delay = (delay_samps < 1) ? 1 : (delay_samps > n - 1 ? n - 1 : delay_samps);
+    g = gain;
+    memset(buf, 0, n * sizeof(float));
+  }
+
+  inline float Process(float x) {
+    const size_t rp = (wp + len - delay) % len;
+    const float d = buf[rp];
+    const float v = x + g * d;   // input + feedback into the delay line
+    buf[wp] = v;
+    wp = (wp + 1) % len;
+    return -g * v + d;           // allpass output (flat magnitude)
+  }
+};
+
+// ============================================================
 // Phantasmagoria dual-grain reverse reader
 // ============================================================
 // Dual-overlap Hann-window granular reverse reader over the rolling
@@ -301,6 +354,7 @@ struct ReverseGrainReader {
 // ============================================================
 static float DSY_SDRAM_BSS main_buf[kMaxDelay];
 static float DSY_SDRAM_BSS rev_buf[kRevSize];
+static float DSY_SDRAM_BSS freeze_diff_buf[kFreezeDiffSize];
 
 Hothouse hw;
 DelBuf main_delay;
@@ -313,6 +367,8 @@ Hp1 rev_hp;       // SPACE-layer output high-pass (remove rumble)
 ReverseGrainReader reverse_reader;  // parallel REVERSE layer source (SW2 DIR)
 Lp1 reverse_lp;                     // gentle pad-friendly tone for reverse
 Lp1 reverse_smooth;                 // extra light pole softening reverse transients
+Hp1 reverse_sum_hp;                 // hybrid: HP the reverse contribution vs forward bass
+Allpass freeze_diffuser;            // freeze-only audible diffusion mask (v0.6.2d)
 
 // Hardware state retained for later DSP milestones.
 Led led_freeze, led_effect;
@@ -570,12 +626,25 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
     // ----- SW2 DIRECTION voice: the main wet delay voice -----
     // SW2 selects the wet delay WORLD, not just an added layer:
     //   UP     = forward only          (fwd 1.0  / rev 0.0)
-    //   MIDDLE = hybrid forward+reverse (fwd 0.75 / rev 0.45)
+    //   MIDDLE = hybrid forward+reverse (fwd 0.80 / rev 0.48)
     //   DOWN   = reverse only           (fwd 0.0  / rev 1.0)
     // The filter and space derive from this voice; the main buffer feedback stays
     // clean-forward so reverse repeats do not become reverse-of-reverse.
+    //
+    // Hybrid low-end fix: blend the reverse term between full-range (forward
+    // absent -> SW2 DOWN) and high-passed (forward present -> SW2 MIDDLE) using
+    // the smoothed forward presence as the crossfade. This removes only the
+    // reverse sub-low that combs against the forward bass; DOWN is untouched
+    // (s_fwd_wet == 0) and the filter runs every sample (click-free).
+    const float reverse_hp = reverse_sum_hp.Process(reverse_voice);
+    // Normalize by the hybrid forward level so MIDDLE drives the HP to ~full
+    // (s_fwd_wet == kFwdWetMid -> 1.0) while DOWN stays 0 (full-range reverse).
+    // Tracks the smoothed s_fwd_wet, so DOWN<->MIDDLE moves stay click-free.
+    const float rev_hp_amt = fclamp(s_fwd_wet.current / kFwdWetMid, 0.0f, 1.0f);
+    const float reverse_for_sum =
+        reverse_voice * (1.0f - rev_hp_amt) + reverse_hp * rev_hp_amt;
     const float direction_voice =
-        forward_voice * s_fwd_wet.current + reverse_voice * s_rev_wet.current;
+        forward_voice * s_fwd_wet.current + reverse_for_sum * s_rev_wet.current;
 
     // Main delay feedback remains clean-forward in all SW2 modes. The audible
     // wet voice can be reverse-only, but the rolling buffer should not contain
@@ -651,6 +720,18 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
     const float freeze_wet_scale =
         1.0f + (freeze_level - 1.0f) * s_freeze.current;
 
+    // FREEZE diffusion mask (v0.6.2d): output-only allpass blend that fades in
+    // with s_freeze^2 (0 when not frozen, <=5% when fully held). It softens the
+    // perception of a hard loop seam without touching the freeze loop, feedback,
+    // reverse, filter, or space. The allpass runs every sample (continuous state)
+    // but is mixed in only by the freeze-scaled amount.
+    const float diffused = freeze_diffuser.Process(delay_plus_space);
+    const float freeze_mask_amt =
+        kFreezeDiffusionMix * s_freeze.current * s_freeze.current;
+    float wet_to_mix =
+        delay_plus_space * (1.0f - freeze_mask_amt) + diffused * freeze_mask_amt;
+    if (IsBad(wet_to_mix)) wet_to_mix = delay_plus_space;
+
     // Constant-power dry/wet mix; pure dry at K1 minimum.
     float out_mono;
     if (s_mix.current <= 0.0005f) {
@@ -659,7 +740,7 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
       float dry_gain = 1.0f;
       float wet_gain = 0.0f;
       EqualPowerGains(s_mix.current, &dry_gain, &wet_gain);
-      out_mono = dry * dry_gain + delay_plus_space * (wet_gain * freeze_wet_scale);
+      out_mono = dry * dry_gain + wet_to_mix * (wet_gain * freeze_wet_scale);
     }
 
     if (IsBad(out_mono)) out_mono = dry;
@@ -687,6 +768,9 @@ int main() {
   reverse_reader.Init();
   reverse_lp.Init(kReverseToneHz, sample_rate);
   reverse_smooth.Init(kReverseSmoothHz, sample_rate);
+  reverse_sum_hp.Init(kReverseSumHpHz, sample_rate);
+  freeze_diffuser.Init(freeze_diff_buf, kFreezeDiffSize, kFreezeDiffDelay,
+                       kFreezeDiffGain);
 
   led_freeze.Init(hw.seed.GetPin(Hothouse::LED_1), false);
   led_effect.Init(hw.seed.GetPin(Hothouse::LED_2), false);
