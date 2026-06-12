@@ -627,6 +627,249 @@ The shipped freeze is a TRUE delay-line freeze, not a separate hold buffer:
 2. Very long holds:
    - Multi-minute freezes may eventually fade or muddy. Known, not a blocker.
 
+## Senior DSP Rules: Freeze / Hold Architecture
+
+The client reference should be interpreted as a musical delay / reverse / freeze instrument, not as a detached looper.
+
+The goal is an integrated wet-memory freeze:
+
+* clean delay is the core memory
+* filter, reverse, and space are renderers around that memory
+* freeze should hold the pedal’s wet memory system
+* freeze should not add an unrelated sampler loop after the effect
+
+### Critical Freeze Rule
+
+Do not implement freeze as a separate output buffer unless explicitly requested.
+
+Avoid this architecture:
+
+```cpp
+capture final_wet_output into hold_buf
+mix hold_buf back after the live output
+```
+
+That sounds like a detached loop layer and does not feel synced to the delay instrument.
+
+Preferred architecture:
+
+```cpp
+freeze the main delay memory / feedback system itself
+```
+
+When freeze is active:
+
+* live input should stop entering the main delay line
+* the existing delay memory should recirculate safely
+* feedback should rise toward a safe near-unity freeze value
+* the pedal should continue reading the same delay memory through the normal wet path
+* SW2 direction rendering should still work
+* K5 filter should still work
+* K6 space should still work
+* K2 should still affect delay / reverse timing behavior
+* K4 HOLD should control frozen wet level
+
+When freeze is inactive:
+
+* normal live input enters the delay line
+* K3 controls normal feedback
+* the v0.5 delay / reverse / filter / space behavior remains unchanged
+
+### Correct Mental Model
+
+Old wrong model:
+
+```text
+freeze the output of the instrument
+```
+
+Correct model:
+
+```text
+freeze the memory inside the instrument
+```
+
+More precisely:
+
+```text
+freeze the main delay memory, then keep rendering that memory through the selected wet instrument path
+```
+
+### Feedback Safety
+
+The v0.5 reverse feedback fix must remain.
+
+Normal feedback source must stay based on the clean forward delay path:
+
+```cpp
+fb_sig = wet_tone * fb_gain;
+```
+
+Do not use these as the main delay feedback source:
+
+```cpp
+reverse_soft
+direction_voice
+delay_plus_space
+final output
+```
+
+Reason:
+Feeding reverse or the full direction voice back into the main delay line can create reverse-of-reverse artifacts, forward-repeat leaks, unstable direction changes, or desync.
+
+### Freeze Write Behavior
+
+The preferred freeze behavior is conceptually:
+
+```cpp
+if freeze is OFF:
+    fb_gain = normal K3 feedback
+    delay_write = live_input + forward_feedback
+
+if freeze is ON:
+    fb_gain = safe near-unity freeze feedback
+    delay_write = forward_feedback
+    // no new live input enters the delay memory
+```
+
+A smoothed transition is preferred:
+
+```cpp
+delay_write = live_input * (1.0f - freeze_amount) + forward_feedback;
+```
+
+Where `freeze_amount` ramps smoothly from 0 to 1.
+
+### Freeze Must Stay Musical
+
+Freeze should feel like:
+
+* the delay bed is being held
+* the current texture is sustained
+* the pedal becomes a playable ambient memory instrument
+
+Freeze should not feel like:
+
+* a separate looper
+* a glitch sampler
+* a disconnected background layer
+* a hard sample-and-repeat effect
+* a new delay running beside the real delay
+
+### Control Rules
+
+FS1:
+
+* tap toggles freeze on/off
+* not momentary
+* must never trigger bootloader by itself
+
+LED1:
+
+* shows freeze active state
+
+K4 HOLD:
+
+* controls the level of the frozen wet memory
+* should not create a separate hold buffer layer
+* should be smoothed
+
+FS2 BYPASS:
+
+* bypass must remain dry only
+* no frozen wet output while bypassed
+
+SW3:
+
+* reserved for later hold modes
+* do not implement SW3 hold modes in v0.6 unless explicitly requested
+
+Future SW3 meaning:
+
+* UP = Pure Freeze
+* MIDDLE = Live Delay Over Freeze
+* DOWN = Absorb / Bleed
+
+### SW3 Scope Clarification
+
+Base v0.6 rule:
+
+* v0.6 Pure Hold must ignore SW3.
+* Do not implement SW3 hold modes unless explicitly requested.
+
+Post-v0.6 extension rule:
+
+* Later versions may use SW3 only when explicitly requested and planned.
+* Example: v0.6.4 Texture Freeze may use SW3 MIDDLE as an explicitly requested extension.
+* Such extensions must still obey the Senior DSP freeze rules:
+  * no detached output looper
+  * protect the v0.5 reverse baseline
+  * do not feed reverse into the main feedback loop
+  * keep bypass dry only
+  * keep `hw.SetAudioBlockSize(1)`
+  * explain the freeze memory architecture before coding
+
+This clarification only removes ambiguity between base v0.6 scope and later
+explicit SW3 extensions. It does not change the meaning of the Senior DSP rules.
+
+### v0.6 Scope
+
+v0.6 should implement only Pure Delay-Line Freeze.
+
+Allowed:
+
+* FS1 toggle freeze
+* LED1 freeze state
+* K4 frozen wet level
+* smooth freeze engage / disengage
+* safe near-unity freeze feedback
+* bootloader moved to FS1 + FS2 held combo
+
+Not allowed in v0.6:
+
+* separate hold buffer
+* detached looper layer
+* absorb / bleed
+* freeze evolution
+* SW3 modes
+* reworking reverse
+* feeding reverse into delay feedback
+* changing K2 reverse timing math
+* changing block size
+* changing bypass behavior
+
+### Core Safety Rules
+
+Always preserve:
+
+```cpp
+hw.SetAudioBlockSize(1);
+```
+
+Do not change block size.
+
+Do not introduce:
+
+* heap allocation in audio code
+* `std::vector` in audio code
+* dynamic allocation in callback
+* large non-SDRAM audio buffers
+* unrelated edits outside `src/PhantasmHothouse`
+
+### Review Rule
+
+Before changing freeze/hold architecture, the agent must explain:
+
+1. What memory is being frozen.
+2. Where the delay write happens.
+3. What the feedback source is.
+4. Whether live input enters the delay during freeze.
+5. Whether freeze is a true delay-memory freeze or a separate output layer.
+6. How bypass remains dry only.
+7. How the v0.5 reverse baseline is protected.
+
+Do not code freeze changes until this explanation is clear.
+
 ## Project separation
 
 Do not confuse PhantasmHothouse with MoonChild or Flux Apparition.
@@ -739,6 +982,18 @@ Direction / reverse / reverse-space
 v0.6:
 Hold/freeze
 
+v0.6.2a: PASS (locked baseline)
+- true delay-line freeze
+- infinite / near-infinite repeat feel
+- live input grace prevents chord cutoff (kLiveGraceMs = 220 ms)
+- live input closes after grace (kLiveWriteFadeCoeff = 0.00015f) so it does not pile up
+- live_write_gain decoupled from s_freeze; main_delay.Write() runs every sample
+- freeze release melts smoothly (kFreezeReleaseCoeff = 0.00004f)
+- kFreezeEngageCoeff = 0.0010f, kFreezeFeedback = 0.995f, raw forward-read freeze feedback
+- no moving lookback, no pitch warble, no tone suck
+- reverse / K2 / SW2 / K4 mapping / DFU LED blink preserved
+- no separate hold buffer; block size 1
+
 v0.7:
 Hold modes: pure / live-over-hold / absorb
 
@@ -767,3 +1022,100 @@ When there is a tradeoff between more features and stability, choose stability.
 When there is a tradeoff between purity and playability, choose playability.
 
 This pedal is for an artist. It must feel good, not just be technically correct.
+
+## DSP Engineering Operating Mode
+
+The agent must behave like a senior audio DSP engineer and boutique pedal designer, not just a code generator.
+
+Core behavior:
+
+* Protect tone quality above feature speed.
+* Preserve the current passed baseline unless the requested change explicitly targets it.
+* Think through the signal path before editing.
+* Identify possible audio artifacts before coding: clicks, pops, pitch warble, zipper noise, tone suck, gain jumps, DC buildup, denormals, feedback runaway, loop seams, combing, phase cancellation, and unwanted filtering.
+* Prefer small reversible changes.
+* Never redesign multiple systems in one pass unless explicitly requested.
+* Always separate planning from implementation for risky DSP changes.
+* When unsure, propose options and recommend the safest first test.
+
+Project golden rules:
+
+* No tone suck.
+* No unnecessary filtering.
+* No unnecessary compression or normalization.
+* No moving read points unless explicitly approved.
+* No hidden modulation.
+* No separate buffer/layer unless explicitly approved.
+* Do not change hw.SetAudioBlockSize(1).
+* Do not break bypass. Bypass must remain direct dry.
+* Do not break the v0.6.2b/v0.6.2a freeze baseline unless the task specifically asks for freeze changes.
+* Do not change reverse/K2 timing unless the task specifically asks for reverse changes.
+* Do not feed reverse, filter, or space into the main delay feedback unless explicitly approved.
+
+DSP workflow:
+
+1. Inspect the existing code and identify the exact signal path involved.
+2. State the current behavior in plain language.
+3. Identify the likely cause of the reported audio issue.
+4. Propose the smallest safe change.
+5. Explain possible risks and what to listen for.
+6. Wait for approval before editing if the change affects audio architecture.
+7. After editing, build with:
+   make -C src/PhantasmHothouse clean
+   make -C src/PhantasmHothouse
+8. Summarize exactly what changed and what was intentionally untouched.
+9. Do not flash unless explicitly approved.
+
+Testing discipline:
+
+* Every audio change must include a hardware listening test plan.
+* Test the simplest mode first before complex modes.
+* For freeze tests, start with SW1 UP, SW2 UP, K5 0, K6 0.
+* Then test filter, space, reverse, and freeze combinations.
+* If a change fails on hardware, revert to the last known-good baseline instead of stacking more fixes on top.
+* If a change creates pitch movement, popping, tone dulling, or robotic behavior, stop and report it.
+
+Baseline protection:
+
+* Passed tags are protected milestones.
+* v0.6.2a passed as Pure Hold With Grace.
+* v0.6.2b passed as Freeze Loop Lock.
+* Future freeze polish must preserve:
+
+  * true delay-line freeze
+  * 220 ms live-input grace
+  * smooth live-input fade-out
+  * integer-locked freeze loop
+  * K2 locked out of frozen forward bed while frozen
+  * no moving lookback
+  * no pitch warble
+  * no tone suck
+
+Freeze-specific guidance:
+
+* The freeze should feel like a suspended delay cloud, not a hard looper.
+* The freeze should not sound like a retriggered sample.
+* The freeze should not pile up new input after the grace window.
+* The freeze should not wander, smear, or die too quickly.
+* Any seam hiding must be subtle and must not create pops, skipped audio, or pitch movement.
+* Do not use the failed v0.6.2c seam-crossfade approach again.
+* Do not use moving lookback reads again.
+* If adding a freeze-only diffusion mask, keep it audible-output-only for the first pass and do not feed it into the main feedback loop.
+
+Code safety:
+
+* No heap allocation in the audio path.
+* No std::vector or dynamic allocation in the audio callback.
+* Use fixed buffers and SDRAM for large buffers.
+* Keep CPU cost low.
+* Guard against NaN/Inf.
+* Keep feedback gains below runaway unless there is a clear limiter/safety plan.
+* Do not make unrelated formatting or cleanup changes during DSP edits.
+
+Communication style:
+
+* Be concise and technical.
+* Explain audio consequences, not just code mechanics.
+* Say when a requested change is risky.
+* Recommend the safest first experiment.
+* If an idea conflicts with the golden rule of no tone suck, say so before coding.
