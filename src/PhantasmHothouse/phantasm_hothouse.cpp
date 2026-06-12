@@ -28,7 +28,8 @@
 // Switch row (mode / world selectors):
 //   SW1 FX     UP clean / MID filtered / DOWN filtered+space.
 //   SW2 DIR    UP forward / MID hybrid / DOWN reverse.  (v0.5: dual-grain reverse)
-//   SW3 HOLD   UP pure hold / MID live-over-hold / DOWN absorb-bleed. (unused)
+//   SW3 HOLD   UP pure / MID live-over-freeze / DOWN absorb-bleed.
+//             (v0.7a: plumbed, all modes currently Pure Freeze)
 // Footswitches:
 //   FS1 HOLD   Freeze delay line toggle.        (v0.6: tap on / tap off)
 //   FS2 BYPASS Effect on/off.  (FS1+FS2 held ~3 s = bootloader)
@@ -135,8 +136,10 @@ static constexpr float kSpaceLevel = 1.0f;       // makeup for the added space l
 
 // Parallel REVERSE layer (SW2 DIR): the Phantasmagoria dual-grain reverse
 // reader sweeps the rolling main delay buffer. SW2 selects the wet direction
-// voice (forward / hybrid / reverse), which also feeds the filter, space, and
-// feedback source so the reverse bed stays glued to the delay.
+// voice (forward / hybrid / reverse), which also feeds the filter and space
+// sources so the reverse bed stays glued to the delay. The main delay feedback
+// source is NOT driven by reverse — it stays clean-forward (wet_tone) so reverse
+// never re-enters the delay loop (v0.5 baseline).
 static constexpr float kReverseOffsetMs = 1.0f;    // tiny minimum read distance
 // K2 controls the PERCEIVED reverse event length. At normal reverse speed the
 // read distance must grow ~2 samples/sample, so a perceived event of E ms needs
@@ -377,6 +380,12 @@ volatile bool bypass = true;
 volatile bool fs1_held = false;
 volatile bool fs2_held = false;
 volatile bool freeze_active = false;  // FS1 toggle: freeze the main delay line
+// SW3 HOLD mode (v0.7a plumbing). SW3 selects a future hold mode; in v0.7a ALL
+// positions behave as Pure Freeze. The mode + smoothed gates below are plumbed
+// for later milestones (v0.7b Absorb/Bleed, v0.7c Live-Over-Freeze) but are NOT
+// wired into any audio math yet, so there is zero audible change.
+enum class HoldMode { kPure, kLiveOverFreeze, kAbsorbBleed };
+volatile HoldMode hold_mode = HoldMode::kPure;
 float knob_values[Hothouse::KNOB_LAST] = {};
 Hothouse::ToggleswitchPosition toggle_positions[3] = {
     Hothouse::TOGGLESWITCH_UNKNOWN, Hothouse::TOGGLESWITCH_UNKNOWN,
@@ -410,6 +419,12 @@ Smoothed s_fwd_wet{1.0f, 1.0f, 0.0015f};       // SW2 DIR forward wet amount (cl
 Smoothed s_rev_wet{0.0f, 0.0f, 0.0015f};       // SW2 DIR reverse wet amount (click-free)
 Smoothed s_freeze_level{1.0f, 1.0f, 0.0010f};  // K4 HOLD frozen wet level
 Smoothed s_freeze{0.0f, 0.0f, 0.0010f};        // freeze engage/disengage (click-free, 0..1)
+// SW3 HOLD-mode gates (v0.7a plumbing): smoothed one-hot weights for the future
+// hold modes, kept warm so later wiring is click-free. Not used in audio yet —
+// all modes currently render as Pure Freeze, so these have zero audible effect.
+Smoothed s_hold_pure{1.0f, 1.0f, 0.0015f};     // SW3 UP weight (Pure Freeze)
+Smoothed s_hold_live{0.0f, 0.0f, 0.0015f};     // SW3 MIDDLE weight (reserved v0.7c)
+Smoothed s_hold_absorb{0.0f, 0.0f, 0.0015f};   // SW3 DOWN weight (reserved v0.7b)
 
 // ============================================================
 // K2 TIME — pad-focused piecewise curve
@@ -512,6 +527,24 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
   s_freeze_level.target = fclamp(knob_values[Hothouse::KNOB_4], 0.0f, 1.0f);
   s_freeze.target = freeze_active ? 1.0f : 0.0f;
 
+  // SW3 HOLD mode select (v0.7a PLUMBING ONLY). Map SW3 to a mode + one-hot gate
+  // targets for future milestones. These DO NOT affect audio yet — every mode is
+  // still rendered as Pure Freeze below — so switching SW3 is silent/zero-change.
+  switch (toggle_positions[2]) {
+    case Hothouse::TOGGLESWITCH_MIDDLE:
+      hold_mode = HoldMode::kLiveOverFreeze;
+      break;
+    case Hothouse::TOGGLESWITCH_DOWN:
+      hold_mode = HoldMode::kAbsorbBleed;
+      break;
+    default:  // UP (or UNKNOWN) -> Pure Freeze
+      hold_mode = HoldMode::kPure;
+      break;
+  }
+  s_hold_pure.target = (hold_mode == HoldMode::kPure) ? 1.0f : 0.0f;
+  s_hold_live.target = (hold_mode == HoldMode::kLiveOverFreeze) ? 1.0f : 0.0f;
+  s_hold_absorb.target = (hold_mode == HoldMode::kAbsorbBleed) ? 1.0f : 0.0f;
+
   for (size_t i = 0; i < size; ++i) {
     const float dry = in[0][i];
 
@@ -532,6 +565,11 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
     s_fwd_wet.Tick();
     s_rev_wet.Tick();
     s_freeze_level.Tick();
+    // SW3 hold-mode gates (v0.7a): ticked to stay click-free for later wiring;
+    // their .current is intentionally not read anywhere yet (zero audible change).
+    s_hold_pure.Tick();
+    s_hold_live.Tick();
+    s_hold_absorb.Tick();
     // Asymmetric freeze smoothing: quick engage toward 1.0, slow melt toward 0.0
     // so turning freeze OFF lets the bed decay gracefully rather than in steps.
     {
