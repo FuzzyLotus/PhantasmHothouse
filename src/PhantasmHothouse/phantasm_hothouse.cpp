@@ -86,6 +86,14 @@ static constexpr float kMaxFeedback = 0.78f;
 // can sit at 0.999 for very long, stable chord holds. Do NOT use 1.0f.
 static constexpr float kFreezeFeedback = 0.999f;
 
+// ABSORB / BLEED (v0.7b, SW3 DOWN): while frozen, let a small amount of new live
+// input bleed into the frozen memory and drop the freeze feedback slightly below
+// kFreezeFeedback so old material gently recedes as new enters (no runaway, no
+// new buffer). Applies ONLY in SW3 DOWN via the smoothed s_hold_absorb gate; UP
+// and MIDDLE keep exact Pure Freeze (live_write -> 0, feedback = kFreezeFeedback).
+static constexpr float kAbsorbLiveWrite = 0.06f;        // post-grace live write in absorb
+static constexpr float kAbsorbFreezeFeedback = 0.996f;  // slightly < unity to make room
+
 // Asymmetric freeze ramp: engage is reasonably quick; release is slow so the
 // frozen bed melts gradually back into the normal delay instead of decaying in
 // stepped chunks. (fonepole coeff -> ~1/(coeff*fs) time constant at 48 kHz.)
@@ -592,7 +600,10 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
       live_write_target = 1.0f;
       live_grace_remain -= 1.0f;
     } else {
-      live_write_target = 0.0f;
+      // After grace: Pure Freeze (UP/MIDDLE) closes live input to 0. Absorb/Bleed
+      // (SW3 DOWN) instead lets a small amount keep bleeding into the frozen
+      // memory, scaled by the smoothed absorb gate so the change is click-free.
+      live_write_target = kAbsorbLiveWrite * s_hold_absorb.current;
     }
     fonepole(live_write_gain, live_write_target, kLiveWriteFadeCoeff);
 
@@ -697,7 +708,16 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
     const float normal_fb = wet_tone * s_feedback.current;
     // Freeze recirculates the latched INTEGER loop (no interpolation, no wander),
     // consistent with the audible frozen forward read above. Raw read (not toned).
-    const float freeze_fb = main_delay.ReadInt(freeze_loop_samps) * kFreezeFeedback;
+    // ABSORB/BLEED (SW3 DOWN): ease the freeze feedback gain from kFreezeFeedback
+    // toward kAbsorbFreezeFeedback (slightly < unity) as the absorb gate engages,
+    // so newly bled-in live material doesn't run away and old material recedes.
+    // active_absorb is 0 in UP/MIDDLE -> gain == kFreezeFeedback (Pure Freeze).
+    const float active_absorb = s_freeze.current * s_hold_absorb.current;
+    const float freeze_feedback_gain =
+        kFreezeFeedback * (1.0f - active_absorb) +
+        kAbsorbFreezeFeedback * active_absorb;
+    const float freeze_fb =
+        main_delay.ReadInt(freeze_loop_samps) * freeze_feedback_gain;
     fb_sig = normal_fb * (1.0f - s_freeze.current) + freeze_fb * s_freeze.current;
     if (IsBad(fb_sig)) fb_sig = 0.0f;
 
