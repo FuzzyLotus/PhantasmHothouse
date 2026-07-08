@@ -69,13 +69,22 @@ using daisysp::fonepole;
 static constexpr float kTwoPi = 6.28318530717958647692f;
 static constexpr float kHalfPi = 1.57079632679489661923f;
 
-// Main delay buffer: 216000 samples == 4.5 s at 48 kHz. Larger than the audio
+// Main delay buffer: 432000 samples == 9.0 s at 48 kHz. Larger than the audio
 // delay range so the reverse reader has room for a long perceived reverse event
 // (at normal reverse speed a perceived N-second event needs a ~2N-second sweep).
-static constexpr size_t kMaxDelay = 216000;
+static constexpr size_t kMaxDelay = 432000;
+
+// Live Delay Over Freeze (v0.7c, SW3 MIDDLE): a SEPARATE forward live delay that
+// plays over the preserved frozen main_delay bed. Own SDRAM buffer; fed by clean
+// dry + its own K3 forward toned feedback; read at the K2 delay time. Covers the
+// full K2 max (4000 ms) with margin. Output-only: summed at the FINAL mix (after
+// K4/freeze_wet_scale) ONLY when frozen AND SW3 MIDDLE; it is NEVER written into
+// main_delay or any main feedback, so the frozen bed and the v0.5 reverse
+// baseline are untouched.
+static constexpr size_t kLiveDelaySize = 216000;  // 4.5 s @ 48 kHz
 
 static constexpr float kTimeMinMs = 20.0f;
-static constexpr float kTimeMaxMs = 1800.0f;
+static constexpr float kTimeMaxMs = 4000.0f;
 
 static constexpr float kMaxFeedback = 0.78f;
 
@@ -366,6 +375,7 @@ struct ReverseGrainReader {
 static float DSY_SDRAM_BSS main_buf[kMaxDelay];
 static float DSY_SDRAM_BSS rev_buf[kRevSize];
 static float DSY_SDRAM_BSS freeze_diff_buf[kFreezeDiffSize];
+static float DSY_SDRAM_BSS live_buf[kLiveDelaySize];  // SW3 MIDDLE live delay (v0.7c)
 
 Hothouse hw;
 DelBuf main_delay;
@@ -380,6 +390,8 @@ Lp1 reverse_lp;                     // gentle pad-friendly tone for reverse
 Lp1 reverse_smooth;                 // extra light pole softening reverse transients
 Hp1 reverse_sum_hp;                 // hybrid: HP the reverse contribution vs forward bass
 Allpass freeze_diffuser;            // freeze-only audible diffusion mask (v0.6.2d)
+DelBuf live_delay;                  // SW3 MIDDLE: live delay over frozen bed (v0.7c)
+Lp1 live_tone;                      // live-delay feedback tone (matches kFeedbackToneHz)
 
 // Hardware state retained for later DSP milestones.
 Led led_freeze, led_effect;
@@ -439,7 +451,7 @@ Smoothed s_hold_absorb{0.0f, 0.0f, 0.0015f};   // SW3 DOWN weight (reserved v0.7
 // ============================================================
 //   0% – 15%  :   20 ms →  350 ms
 //  15% – 55%  :  350 ms → 1200 ms
-//  55% – 100% : 1200 ms → 1800 ms
+//  55% – 100% : 1200 ms → 4000 ms
 static float KnobToDelayMs(float knob) {
   knob = fclamp(knob, 0.0f, 1.0f);
   if (knob <= 0.15f) {
@@ -648,6 +660,25 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
     const float wet_tone = tone_lpf.Process(wet);
     const float forward_voice = gentle_saturate(wet_tone);
 
+    // ----- Live Delay Over Freeze voice (v0.7c, SW3 MIDDLE) -----
+    // A SEPARATE forward delay so the player can play a live delay over the
+    // preserved frozen bed. Runs every sample (continuous state, click-free).
+    // Fed by clean dry + its own K3 toned forward feedback; read at the same K2
+    // time (read_pos). It is NEVER written into main_delay or any main feedback,
+    // so the frozen bed and the clean-forward main feedback are untouched. Its
+    // output is mixed in only when frozen AND SW3 MIDDLE (live_gain below).
+    float live_read = live_delay.Read(read_pos);
+    if (IsBad(live_read)) live_read = 0.0f;
+    const float live_toned = live_tone.Process(live_read);
+    float live_in = dry + live_toned * s_feedback.current;
+    if (s_feedback.current > 0.3f) {
+      live_in = fast_tanh(live_in * 0.5f) * 2.0f;
+    }
+    if (IsBad(live_in)) live_in = dry;
+    live_delay.Write(live_in);
+    float live_voice = gentle_saturate(live_toned);
+    if (IsBad(live_voice)) live_voice = 0.0f;
+
     // ----- Reverse voice (Phantasmagoria dual-grain reader) -----
     // Reads the SAME rolling main delay buffer (Phantasmagoria dual-grain). K2
     // sets the PERCEIVED reverse event length via the already-smoothed
@@ -799,6 +830,12 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
       float wet_gain = 0.0f;
       EqualPowerGains(s_mix.current, &dry_gain, &wet_gain);
       out_mono = dry * dry_gain + wet_to_mix * (wet_gain * freeze_wet_scale);
+      // Live Delay Over Freeze (v0.7c): add the live delay voice ONLY when frozen
+      // AND SW3 MIDDLE (live_gain = s_freeze * s_hold_live). Added AFTER
+      // freeze_wet_scale so K4 trims only the frozen bed, NOT the live delay; it
+      // rides wet_gain (K1) so pure-dry stays clean and bypass is unaffected.
+      const float live_gain = s_freeze.current * s_hold_live.current;
+      out_mono += live_voice * (wet_gain * live_gain);
     }
 
     if (IsBad(out_mono)) out_mono = dry;
@@ -829,6 +866,8 @@ int main() {
   reverse_sum_hp.Init(kReverseSumHpHz, sample_rate);
   freeze_diffuser.Init(freeze_diff_buf, kFreezeDiffSize, kFreezeDiffDelay,
                        kFreezeDiffGain);
+  live_delay.Init(live_buf, kLiveDelaySize);
+  live_tone.Init(kFeedbackToneHz, sample_rate);
 
   led_freeze.Init(hw.seed.GetPin(Hothouse::LED_1), false);
   led_effect.Init(hw.seed.GetPin(Hothouse::LED_2), false);
