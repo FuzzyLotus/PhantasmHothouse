@@ -81,7 +81,10 @@ static constexpr size_t kMaxDelay = 432000;
 // K4/freeze_wet_scale) ONLY when frozen AND SW3 MIDDLE; it is NEVER written into
 // main_delay or any main feedback, so the frozen bed and the v0.5 reverse
 // baseline are untouched.
-static constexpr size_t kLiveDelaySize = 216000;  // 4.5 s @ 48 kHz
+// full K2 max (4000 ms) forward read plus the same reverse sweep headroom as
+// main_delay (kReverseSpeed=2 needs ~8 s history at max K2). Matched to kMaxDelay
+// so live reverse timing tracks main reverse at all K2 settings.
+static constexpr size_t kLiveDelaySize = kMaxDelay;
 
 static constexpr float kTimeMinMs = 20.0f;
 static constexpr float kTimeMaxMs = 4000.0f;
@@ -158,16 +161,14 @@ static constexpr float kSpaceLevel = 1.0f;       // makeup for the added space l
 // source is NOT driven by reverse — it stays clean-forward (wet_tone) so reverse
 // never re-enters the delay loop (v0.5 baseline).
 static constexpr float kReverseOffsetMs = 1.0f;    // tiny minimum read distance
-// K2 controls the PERCEIVED reverse event length. At normal reverse speed the
-// read distance must grow ~2 samples/sample, so a perceived event of E ms needs
-// a sweep of ~2*E ms of buffer history:
+// K2 controls the reverse event length — same range as the forward delay read
+// (kTimeMinMs..kTimeMaxMs). Reverse must track the delay knob so hybrid SW2
+// MIDDLE stays glued; the old 650–1900 ms clamp caused desync at short/long K2.
+// At normal reverse speed the read distance grows ~2 samples/sample, so event E
+// needs a sweep of ~2*E ms of buffer history:
 //   sweepSamples = eventMs * kReverseSpeed * sr/1000
 //   freq         = kReverseSpeed * sr / sweepSamples   (== 1000 / eventMs)
-// This keeps correct reverse pitch/speed while K2 sets how long the reverse bed
-// feels (not just a fast 1 s grain).
 static constexpr float kReverseSpeed = 2.0f;          // read-distance growth (samp/samp)
-static constexpr float kReverseEventMinMs = 650.0f;   // shortest perceived reverse
-static constexpr float kReverseEventMaxMs = 1900.0f;  // longest perceived reverse
 // Reverse tone + a second light smoothing pole soften hard-attack grain
 // transients without over-darkening; the reverse stays clear and present.
 static constexpr float kReverseToneHz = 5500.0f;    // main reverse low-pass (conservative)
@@ -392,6 +393,10 @@ Hp1 reverse_sum_hp;                 // hybrid: HP the reverse contribution vs fo
 Allpass freeze_diffuser;            // freeze-only audible diffusion mask (v0.6.2d)
 DelBuf live_delay;                  // SW3 MIDDLE: live delay over frozen bed (v0.7c)
 Lp1 live_tone;                      // live-delay feedback tone (matches kFeedbackToneHz)
+ReverseGrainReader live_reverse_reader;  // SW2 DIR on live_delay (output-only, v0.7c+)
+Lp1 live_reverse_lp;                   // separate tone state from frozen-bed reverse
+Lp1 live_reverse_smooth;               // separate smooth state from frozen-bed reverse
+Hp1 live_reverse_sum_hp;               // hybrid low-end fix on live reverse sum
 
 // Hardware state retained for later DSP milestones.
 Led led_freeze, led_effect;
@@ -450,17 +455,25 @@ Smoothed s_hold_absorb{0.0f, 0.0f, 0.0015f};   // SW3 DOWN weight (reserved v0.7
 // K2 TIME — pad-focused piecewise curve
 // ============================================================
 //   0% – 15%  :   20 ms →  350 ms
-//  15% – 55%  :  350 ms → 1200 ms
-//  55% – 100% : 1200 ms → 4000 ms
+//  15% – 50%  :  350 ms → 1200 ms
+//  50% – 72%  : 1200 ms → 2500 ms   (sweet-spot approach)
+//  72% – 90%  : 2500 ms → 3000 ms   (wider sweet-spot dial zone)
+//  90% – 100% : 3000 ms → 4000 ms   (long tail to max)
 static float KnobToDelayMs(float knob) {
   knob = fclamp(knob, 0.0f, 1.0f);
   if (knob <= 0.15f) {
     return LogLerpMs(20.0f, 350.0f, knob / 0.15f);
   }
-  if (knob <= 0.55f) {
-    return LogLerpMs(350.0f, 1200.0f, (knob - 0.15f) / 0.40f);
+  if (knob <= 0.50f) {
+    return LogLerpMs(350.0f, 1200.0f, (knob - 0.15f) / 0.35f);
   }
-  return LogLerpMs(1200.0f, kTimeMaxMs, (knob - 0.55f) / 0.45f);
+  if (knob <= 0.72f) {
+    return LogLerpMs(1200.0f, 2500.0f, (knob - 0.50f) / 0.22f);
+  }
+  if (knob <= 0.90f) {
+    return LogLerpMs(2500.0f, 3000.0f, (knob - 0.72f) / 0.18f);
+  }
+  return LogLerpMs(3000.0f, kTimeMaxMs, (knob - 0.90f) / 0.10f);
 }
 
 static float KnobToDelaySamples(float knob) {
@@ -661,12 +674,10 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
     const float forward_voice = gentle_saturate(wet_tone);
 
     // ----- Live Delay Over Freeze voice (v0.7c, SW3 MIDDLE) -----
-    // A SEPARATE forward delay so the player can play a live delay over the
-    // preserved frozen bed. Runs every sample (continuous state, click-free).
-    // Fed by clean dry + its own K3 toned forward feedback; read at the same K2
-    // time (read_pos). It is NEVER written into main_delay or any main feedback,
-    // so the frozen bed and the clean-forward main feedback are untouched. Its
-    // output is mixed in only when frozen AND SW3 MIDDLE (live_gain below).
+    // A SEPARATE delay so the player can play over the preserved frozen bed.
+    // Write/feedback stays clean-forward only; SW2 DIR selects the audible live
+    // direction voice (forward / hybrid / reverse) at the final mix. It is NEVER
+    // written into main_delay or any main feedback.
     float live_read = live_delay.Read(read_pos);
     if (IsBad(live_read)) live_read = 0.0f;
     const float live_toned = live_tone.Process(live_read);
@@ -676,8 +687,42 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
     }
     if (IsBad(live_in)) live_in = dry;
     live_delay.Write(live_in);
-    float live_voice = gentle_saturate(live_toned);
-    if (IsBad(live_voice)) live_voice = 0.0f;
+    float live_forward_voice = gentle_saturate(live_toned);
+    if (IsBad(live_forward_voice)) live_forward_voice = 0.0f;
+
+    // Shared K2/reverse timing for main + live reverse readers (same math; both
+    // buffers are kMaxDelay so sweep clamps match).
+    const float delay_ms = s_delay.current / (sample_rate / 1000.0f);
+    const float reverse_event_ms =
+        fclamp(delay_ms, kTimeMinMs, kTimeMaxMs);
+    const float rev_sweep_unclamped =
+        reverse_event_ms * kReverseSpeed * (sample_rate / 1000.0f);
+    float rev_sweep_samps =
+        fclamp(rev_sweep_unclamped, 1.0f, static_cast<float>(kMaxDelay) - 4.0f);
+    const float live_rev_sweep_samps =
+        fclamp(rev_sweep_unclamped, 1.0f, static_cast<float>(kLiveDelaySize) - 4.0f);
+    const float rev_freq_hz = kReverseSpeed * sample_rate / rev_sweep_samps;
+    const float live_rev_freq_hz =
+        kReverseSpeed * sample_rate / live_rev_sweep_samps;
+
+    // Live reverse (output-only): dual-grain reader over live_delay, never fed back.
+    float live_reverse_grain = live_reverse_reader.Process(
+        live_delay, sample_rate, live_rev_sweep_samps, live_rev_freq_hz, 0.0f);
+    if (IsBad(live_reverse_grain)) live_reverse_grain = 0.0f;
+    const float live_reverse_soft = live_reverse_smooth.Process(
+        live_reverse_lp.Process(live_reverse_grain));
+    float live_reverse_voice = gentle_saturate(live_reverse_soft * kReverseMakeup);
+    if (IsBad(live_reverse_voice)) live_reverse_voice = 0.0f;
+    const float live_reverse_hp = live_reverse_sum_hp.Process(live_reverse_voice);
+    const float live_rev_hp_amt =
+        fclamp(s_fwd_wet.current / kFwdWetMid, 0.0f, 1.0f);
+    const float live_reverse_for_sum =
+        live_reverse_voice * (1.0f - live_rev_hp_amt) +
+        live_reverse_hp * live_rev_hp_amt;
+    float live_direction_voice =
+        live_forward_voice * s_fwd_wet.current +
+        live_reverse_for_sum * s_rev_wet.current;
+    if (IsBad(live_direction_voice)) live_direction_voice = 0.0f;
 
     // ----- Reverse voice (Phantasmagoria dual-grain reader) -----
     // Reads the SAME rolling main delay buffer (Phantasmagoria dual-grain). K2
@@ -687,14 +732,6 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
     // samples/sample — reverse pitch/speed stays correct (no octaver) while K2
     // changes how long the reverse bed feels. Sweep is clamped within the
     // buffer; phase is never reset on K2 moves; s_delay is smoothed (zipper-free).
-    const float delay_ms = s_delay.current / (sample_rate / 1000.0f);
-    const float reverse_event_ms =
-        fclamp(delay_ms, kReverseEventMinMs, kReverseEventMaxMs);
-    float rev_sweep_samps =
-        reverse_event_ms * kReverseSpeed * (sample_rate / 1000.0f);
-    rev_sweep_samps =
-        fclamp(rev_sweep_samps, 1.0f, static_cast<float>(kMaxDelay) - 4.0f);
-    const float rev_freq_hz = kReverseSpeed * sample_rate / rev_sweep_samps;
     float reverse_grain = reverse_reader.Process(main_delay, sample_rate,
                                                  rev_sweep_samps, rev_freq_hz, 0.0f);
     if (IsBad(reverse_grain)) reverse_grain = 0.0f;
@@ -830,12 +867,10 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
       float wet_gain = 0.0f;
       EqualPowerGains(s_mix.current, &dry_gain, &wet_gain);
       out_mono = dry * dry_gain + wet_to_mix * (wet_gain * freeze_wet_scale);
-      // Live Delay Over Freeze (v0.7c): add the live delay voice ONLY when frozen
-      // AND SW3 MIDDLE (live_gain = s_freeze * s_hold_live). Added AFTER
-      // freeze_wet_scale so K4 trims only the frozen bed, NOT the live delay; it
-      // rides wet_gain (K1) so pure-dry stays clean and bypass is unaffected.
+      // Live Delay Over Freeze (v0.7c+): live_direction_voice follows SW2 DIR.
+      // Added AFTER freeze_wet_scale so K4 trims only the frozen bed.
       const float live_gain = s_freeze.current * s_hold_live.current;
-      out_mono += live_voice * (wet_gain * live_gain);
+      out_mono += live_direction_voice * (wet_gain * live_gain);
     }
 
     if (IsBad(out_mono)) out_mono = dry;
@@ -868,6 +903,10 @@ int main() {
                        kFreezeDiffGain);
   live_delay.Init(live_buf, kLiveDelaySize);
   live_tone.Init(kFeedbackToneHz, sample_rate);
+  live_reverse_reader.Init();
+  live_reverse_lp.Init(kReverseToneHz, sample_rate);
+  live_reverse_smooth.Init(kReverseSmoothHz, sample_rate);
+  live_reverse_sum_hp.Init(kReverseSumHpHz, sample_rate);
 
   led_freeze.Init(hw.seed.GetPin(Hothouse::LED_1), false);
   led_effect.Init(hw.seed.GetPin(Hothouse::LED_2), false);
