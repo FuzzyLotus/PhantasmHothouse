@@ -1011,6 +1011,17 @@ v0.6.2a: PASS (locked baseline)
 v0.7:
 Hold modes: pure / live-over-hold / absorb
 
+v0.7f: PASS (current shipped baseline — 2026-07-17)
+- K2-scaled post-freeze capture grace (one delay loop; replaced fixed 220 ms)
+- SW3 UP pure / MID live-over / DOWN absorb + live-over
+- FS1 tap toggle freeze (v0.7e behavior)
+- Reverse event tracks full K2 (20–4000 ms); live delay follows SW2 DIR
+- Tag: `phantasm-hothouse-v0.7f`
+
+Note: `phantasm-hothouse-v0.8a` (FS1 hold-capture) was tried and retracted;
+that tag was deleted so it cannot be confused with a real v0.8 milestone.
+Next v0.8 work starts fresh from v0.7f.
+
 Do not skip ahead unless explicitly instructed.
 
 ## Git rules
@@ -1094,10 +1105,11 @@ Baseline protection:
 * Passed tags are protected milestones.
 * v0.6.2a passed as Pure Hold With Grace.
 * v0.6.2b passed as Freeze Loop Lock.
+* v0.7f passed as current hold-mode baseline (K2-scaled grace + SW3 modes).
 * Future freeze polish must preserve:
 
   * true delay-line freeze
-  * 220 ms live-input grace
+  * K2-scaled live-input grace (one latched delay loop)
   * smooth live-input fade-out
   * integer-locked freeze loop
   * K2 locked out of frozen forward bed while frozen

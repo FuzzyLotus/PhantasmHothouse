@@ -2,22 +2,38 @@
 
 Contributed by David Viau \<<dalexviau@gmail.com>\>
 
+GPL firmware for Cleveland Music Co. Hothouse / Daisy Seed.
+
+**Current baseline:** [`phantasm-hothouse-v0.7f`](https://github.com/FuzzyLotus/PhantasmHothouse/releases/tag/phantasm-hothouse-v0.7f)
+
+Phantasmagoria-inspired reverse/freeze delay. Not an Echoplex clone.
+
 ## Description
 
-A brief description of the effect goes here.
+Pad-focused delay with parallel filter, space, reverse direction, and delay-line freeze hold modes.
 
 ### Controls
 
 | CONTROL | DESCRIPTION | NOTES |
 |-|-|-|
-| KNOB 1 | Unused |  |
-| KNOB 2 | Unused |  |
-| KNOB 3 | Unused |  |
-| KNOB 4 | Unused |  |
-| KNOB 5 | Unused |  |
-| KNOB 6 | Unused |  |
-| SWITCH 1 | Unused | **UP** - <br/>**MIDDLE** - <br/>**DOWN** -  |
-| SWITCH 2 | Unused | **UP** - <br/>**MIDDLE** - <br/>**DOWN** -  |
-| SWITCH 3 | Unused | **UP** - <br/>**MIDDLE** - <br/>**DOWN** -  |
-| FOOTSWITCH 1 | Unused |  |
-| FOOTSWITCH 2 | Bypass | The bypassed signal is buffered |
+| KNOB 1 | MIX | Dry / wet |
+| KNOB 2 | TIME | Delay time, pad curve (20–4000 ms) |
+| KNOB 3 | SUSTAIN | Feedback |
+| KNOB 4 | HOLD | Frozen wet level |
+| KNOB 5 | FILTER | Filtered repeats blend |
+| KNOB 6 | SPACE | Reverb / space blend (SW1 DOWN) |
+| SWITCH 1 | FX | **UP** clean / **MID** filtered / **DOWN** filtered+space |
+| SWITCH 2 | DIR | **UP** forward / **MID** hybrid / **DOWN** reverse |
+| SWITCH 3 | HOLD | **UP** pure freeze / **MID** live-over / **DOWN** absorb + live-over |
+| FOOTSWITCH 1 | HOLD | Tap freeze on/off |
+| FOOTSWITCH 2 | Bypass | Buffered dry when bypassed |
+| FS1 + FS2 | Bootloader | Hold both ~3 s |
+
+### Build
+
+```bash
+make -C src/PhantasmHothouse clean
+make -C src/PhantasmHothouse
+```
+
+Audio block size must remain `1`.
