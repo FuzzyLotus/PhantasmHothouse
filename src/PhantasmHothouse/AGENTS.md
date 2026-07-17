@@ -627,6 +627,20 @@ The shipped freeze is a TRUE delay-line freeze, not a separate hold buffer:
 2. Very long holds:
    - Multi-minute freezes may eventually fade or muddy. Known, not a blocker.
 
+3. K2 retune while frozen (idea only — do NOT implement unless explicitly requested):
+   - Wish: turn K2 while frozen to change the current playing freeze loop length
+     (today `freeze_loop_samps` is latched at engage; K2 is locked out of the
+     frozen forward bed / feedback by design).
+   - Continuous tracking of `s_delay` while frozen is NOT safe on this delay-line
+     freeze: moving the recirculating read length near unity causes pitch warble /
+     Doppler (violates no-moving-read / no-pitch-warble rules).
+   - Safer-but-not-artifact-free options if pursued later: settle-then-relatch with
+     a short crossfade to a new integer length, or audible-only window change with
+     feedback still latched. True pitch-preserving retune needs a different buffer
+     model, not this architecture.
+   - Decision (2026-07-17): leave locked; note for future discussion only.
+     Live-over (SW3 MID/DOWN) already follows K2 for playable material over the bed.
+
 ## Senior DSP Rules: Freeze / Hold Architecture
 
 The client reference should be interpreted as a musical delay / reverse / freeze instrument, not as a detached looper.

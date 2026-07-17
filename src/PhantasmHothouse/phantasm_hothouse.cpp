@@ -29,12 +29,12 @@
 //   SW1 FX     UP clean / MID filtered / DOWN filtered+space.
 //   SW2 DIR    UP forward / MID hybrid / DOWN reverse.  (v0.5: dual-grain reverse)
 //   SW3 HOLD   UP pure / MID live-over-freeze / DOWN absorb-bleed.
+//             (v0.7a: plumbed, all modes currently Pure Freeze)
 // Footswitches:
-//   FS1 HOLD   Short tap = lock/release delay bed (v0.6+).
-//              Hold >300 ms while live = capture (compose), release = lock (v0.8a).
+//   FS1 HOLD   Freeze delay line toggle.        (v0.6: tap on / tap off)
 //   FS2 BYPASS Effect on/off.  (FS1+FS2 held ~3 s = bootloader)
 // LEDs:
-//   LED1 HOLD   Off=live, pulse=capture, solid=frozen.
+//   LED1 HOLD   Hold/freeze status.
 //   LED2 EFFECT Bypass/engaged status.
 //
 // DSP architecture: the clean delay (top row) is the CORE MEMORY. Filter,
@@ -74,13 +74,13 @@ static constexpr float kHalfPi = 1.57079632679489661923f;
 // (at normal reverse speed a perceived N-second event needs a ~2N-second sweep).
 static constexpr size_t kMaxDelay = 432000;
 
-// Live Delay Over Freeze (v0.7c, SW3 MIDDLE): a SEPARATE forward live delay that
-// plays over the preserved frozen main_delay bed. Own SDRAM buffer; fed by clean
-// dry + its own K3 forward toned feedback; read at the K2 delay time. Covers the
-// full K2 max (4000 ms) with margin. Output-only: summed at the FINAL mix (after
-// K4/freeze_wet_scale) ONLY when frozen AND SW3 MIDDLE; it is NEVER written into
-// main_delay or any main feedback, so the frozen bed and the v0.5 reverse
-// baseline are untouched.
+// Live Delay Over Freeze (v0.7c, SW3 MIDDLE/DOWN): a SEPARATE forward live delay
+// that plays over the preserved frozen main_delay bed. Own SDRAM buffer; fed by
+// clean dry + its own K3 forward toned feedback; read at the K2 delay time.
+// Covers the full K2 max (4000 ms) with margin. Output-only: summed at the FINAL
+// mix (after K4/freeze_wet_scale) when frozen AND SW3 MIDDLE or DOWN; it is NEVER
+// written into main_delay or any main feedback, so the frozen bed and the v0.5
+// reverse baseline are untouched.
 // full K2 max (4000 ms) forward read plus the same reverse sweep headroom as
 // main_delay (kReverseSpeed=2 needs ~8 s history at max K2). Matched to kMaxDelay
 // so live reverse timing tracks main reverse at all K2 settings.
@@ -101,9 +101,8 @@ static constexpr float kFreezeFeedback = 0.999f;
 // ABSORB / BLEED (v0.7b, SW3 DOWN): while frozen, let a small amount of new live
 // input bleed into the frozen memory and drop the freeze feedback slightly below
 // kFreezeFeedback so old material gently recedes as new enters (no runaway, no
-// new buffer). SW3 DOWN also enables the separate live_delay output layer (same as
-// MIDDLE) so you can play over the bed while it absorbs. UP/MIDDLE main_delay
-// live_write: UP -> 0 after grace; MIDDLE -> 0 after grace; DOWN -> absorb bleed.
+// new buffer). Applies ONLY in SW3 DOWN via the smoothed s_hold_absorb gate; UP
+// and MIDDLE keep exact Pure Freeze (live_write -> 0, feedback = kFreezeFeedback).
 static constexpr float kAbsorbLiveWrite = 0.06f;        // post-grace live write in absorb
 static constexpr float kAbsorbFreezeFeedback = 0.996f;  // slightly < unity to make room
 
@@ -114,20 +113,11 @@ static constexpr float kFreezeEngageCoeff = 0.0010f;    // ~80 ms engage
 static constexpr float kFreezeReleaseCoeff = 0.00004f;  // ~2 s graceful melt
 
 // FREEZE live-input write gate (v0.6.2a "Pure Hold With Grace"): decoupled from
-// s_freeze. When freeze engages, dry input keeps writing into the delay for a
-// short grace window (so the chord isn't chopped), then fades out so playing over
-// a freeze doesn't endlessly stack into the near-unity loop. main_delay.Write()
-// still runs every sample (it always writes the feedback signal).
-static constexpr float kLiveGraceMs = 220.0f;           // dry stays in this long after engage
+// s_freeze. When freeze engages, dry input keeps writing for one full delay loop
+// (matches latched freeze_loop_samps / current K2) so the chord isn't chopped,
+// then fades out so playing over a freeze doesn't endlessly stack into the
+// near-unity loop. main_delay.Write() still runs every sample (feedback always).
 static constexpr float kLiveWriteFadeCoeff = 0.00015f;  // ~150 ms smooth live-input fade
-
-// FS1 hybrid tap/hold (v0.8a): hold longer than this from Live enters Capture
-// (delay keeps listening); release commits the bed. Shorter = tap toggle lock.
-static constexpr float kFs1HoldThresholdMs = 300.0f;
-// Footswitch debounce / post-engage cooldown (v0.8a fix): chatter during a long
-// hold was clearing capture state so release committed nothing.
-static constexpr uint32_t kFs1DebounceSamples = 240;       // ~5 ms @ 48 kHz
-static constexpr uint32_t kFs1EngageCooldownSamples = 2400;  // ~50 ms @ 48 kHz
 
 // FREEZE diffusion mask (v0.6.2d): a tiny freeze-ONLY audible allpass diffuser
 // mixed in very low to soften loop-seam perception. Output-only — never written
@@ -413,9 +403,11 @@ Led led_freeze, led_effect;
 volatile bool bypass = true;
 volatile bool fs1_held = false;
 volatile bool fs2_held = false;
-volatile bool freeze_active = false;       // delay bed locked (Frozen)
-volatile bool fs1_capture_active = false;  // FS1 held past threshold while Live (Capture)
-// SW3 HOLD mode select. Maps SW3 to hold behavior while frozen.
+volatile bool freeze_active = false;  // FS1 toggle: freeze the main delay line
+// SW3 HOLD mode (v0.7a plumbing). SW3 selects a future hold mode; in v0.7a ALL
+// positions behave as Pure Freeze. The mode + smoothed gates below are plumbed
+// for later milestones (v0.7b Absorb/Bleed, v0.7c Live-Over-Freeze) but are NOT
+// wired into any audio math yet, so there is zero audible change.
 enum class HoldMode { kPure, kLiveOverFreeze, kAbsorbBleed };
 volatile HoldMode hold_mode = HoldMode::kPure;
 float knob_values[Hothouse::KNOB_LAST] = {};
@@ -429,14 +421,6 @@ float rev_fb = 0.0f;  // SPACE-layer reverb feedback (separate from clean loop)
 float live_write_gain = 1.0f;       // dry-input write gate (Pure Hold With Grace)
 float live_grace_remain = 0.0f;     // grace countdown in samples (audio thread only)
 size_t freeze_loop_samps = 2400;    // latched integer freeze loop length (audio thread only)
-
-enum class Fs1PressKind : uint8_t { kNone, kPending, kCapture };
-static uint32_t fs1_pressed_stable = 0;
-static uint32_t fs1_released_stable = 0;
-static bool fs1_debounced = false;
-static Fs1PressKind fs1_press_kind = Fs1PressKind::kNone;
-static float fs1_press_samples = 0.0f;
-static uint32_t fs1_engage_cooldown = 0;
 
 // ============================================================
 // Smoothed parameters
@@ -502,20 +486,6 @@ static inline void EqualPowerGains(float mix, float* dry_gain, float* wet_gain) 
   *wet_gain = sinf(angle);
 }
 
-static inline void EngageFreezeLatch() {
-  freeze_active = true;
-  live_grace_remain = kLiveGraceMs * (sample_rate / 1000.0f);
-  freeze_loop_samps = static_cast<size_t>(
-      lroundf(fclamp(s_delay.current, 1.0f,
-                     static_cast<float>(kMaxDelay) - 2.0f)));
-  fs1_engage_cooldown = kFs1EngageCooldownSamples;
-}
-
-static inline void DisengageFreeze() {
-  freeze_active = false;
-  live_grace_remain = 0.0f;
-}
-
 static inline bool IsBad(float x) { return !std::isfinite(x); }
 
 // ============================================================
@@ -528,73 +498,22 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
   if (hw.switches[Hothouse::FOOTSWITCH_2].RisingEdge()) {
     bypass = !bypass;
   }
-
-  // FS1 hybrid tap/hold (v0.8a): short tap toggles lock; hold >300 ms while Live
-  // enters Capture (normal delay, full input); release commits the bed. Hold while
-  // already frozen does nothing extra (no accumulate in v0.8a). Debounced edges +
-  // press-kind FSM prevent switch chatter from clearing capture before release.
-  const bool fs1_raw = hw.switches[Hothouse::FOOTSWITCH_1].Pressed();
-  if (fs1_engage_cooldown > 0) {
-    fs1_engage_cooldown--;
-  }
-
-  bool fs1_db_rise = false;
-  bool fs1_db_fall = false;
-  if (fs1_raw) {
-    fs1_released_stable = 0;
-    if (fs1_pressed_stable < kFs1DebounceSamples) {
-      fs1_pressed_stable++;
-      if (fs1_pressed_stable == kFs1DebounceSamples && !fs1_debounced) {
-        fs1_db_rise = true;
-        fs1_debounced = true;
-      }
-    }
-  } else {
-    fs1_pressed_stable = 0;
-    if (fs1_released_stable < kFs1DebounceSamples) {
-      fs1_released_stable++;
-      if (fs1_released_stable == kFs1DebounceSamples && fs1_debounced) {
-        fs1_db_fall = true;
-        fs1_debounced = false;
-      }
+  // FS1 is a toggle (not momentary): tap to freeze/unfreeze the main delay line.
+  if (hw.switches[Hothouse::FOOTSWITCH_1].RisingEdge()) {
+    freeze_active = !freeze_active;
+    if (freeze_active) {
+      // Latch an INTEGER loop length so the frozen forward bed/feedback can't
+      // wander (K2) or smear (fractional interpolation) while held.
+      freeze_loop_samps = static_cast<size_t>(
+          lroundf(fclamp(s_delay.current, 1.0f,
+                         static_cast<float>(kMaxDelay) - 2.0f)));
+      // Capture grace = one delay loop (scales with K2: 20–4000 ms).
+      live_grace_remain = static_cast<float>(freeze_loop_samps);
+    } else {
+      live_grace_remain = 0.0f;
     }
   }
-
-  const float fs1_hold_thresh_samps =
-      kFs1HoldThresholdMs * (sample_rate / 1000.0f);
-
-  if (fs1_engage_cooldown == 0) {
-    if (fs1_db_rise) {
-      fs1_press_kind = Fs1PressKind::kPending;
-      fs1_press_samples = 0.0f;
-      fs1_capture_active = false;
-    }
-    if (fs1_debounced && fs1_press_kind != Fs1PressKind::kNone) {
-      fs1_press_samples += 1.0f;
-      if (!freeze_active && fs1_press_kind == Fs1PressKind::kPending &&
-          fs1_press_samples >= fs1_hold_thresh_samps) {
-        fs1_press_kind = Fs1PressKind::kCapture;
-        fs1_capture_active = true;
-      }
-    }
-    if (fs1_db_fall) {
-      if (fs1_press_kind == Fs1PressKind::kCapture && !freeze_active) {
-        EngageFreezeLatch();
-      } else if (fs1_press_kind == Fs1PressKind::kPending &&
-                 fs1_press_samples < fs1_hold_thresh_samps) {
-        if (freeze_active) {
-          DisengageFreeze();
-        } else {
-          EngageFreezeLatch();
-        }
-      }
-      fs1_press_kind = Fs1PressKind::kNone;
-      fs1_press_samples = 0.0f;
-      fs1_capture_active = false;
-    }
-  }
-
-  fs1_held = fs1_debounced;
+  fs1_held = hw.switches[Hothouse::FOOTSWITCH_1].Pressed();
   fs2_held = hw.switches[Hothouse::FOOTSWITCH_2].Pressed();
 
   for (size_t i = 0; i < Hothouse::KNOB_LAST; ++i) {
@@ -640,7 +559,9 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
   s_freeze_level.target = fclamp(knob_values[Hothouse::KNOB_4], 0.0f, 1.0f);
   s_freeze.target = freeze_active ? 1.0f : 0.0f;
 
-  // SW3 HOLD mode select: one-hot smoothed gates for pure / live-over / absorb.
+  // SW3 HOLD mode select (v0.7a PLUMBING ONLY). Map SW3 to a mode + one-hot gate
+  // targets for future milestones. These DO NOT affect audio yet — every mode is
+  // still rendered as Pure Freeze below — so switching SW3 is silent/zero-change.
   switch (toggle_positions[2]) {
     case Hothouse::TOGGLESWITCH_MIDDLE:
       hold_mode = HoldMode::kLiveOverFreeze;
@@ -693,9 +614,9 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
     // Live-input write gate (Pure Hold With Grace), DECOUPLED from s_freeze.
     // s_freeze still drives feedback ramp/crossfade and wet scaling; this only
     // controls whether new dry input enters the delay memory. On freeze ON the
-    // dry keeps writing through a short grace window (chord not chopped) then
-    // fades to 0 (so playing over the freeze doesn't endlessly stack). On freeze
-    // OFF it returns to 1.0 so normal playing writes fully again.
+    // dry keeps writing for one delay loop (K2-scaled grace) then fades to 0
+    // (so playing over the freeze doesn't endlessly stack). On freeze OFF it
+    // returns to 1.0 so normal playing writes fully again.
     float live_write_target;
     if (!freeze_active) {
       live_write_target = 1.0f;
@@ -1036,13 +957,8 @@ int main() {
       led_freeze.Set(lvl);
       led_effect.Set(lvl);
     } else {
-      // Normal: LED1 pulse = Capture, solid = Frozen, off = Live.
-      if (fs1_capture_active) {
-        const bool pulse_on = ((System::GetNow() / 250) & 1u) != 0u;
-        led_freeze.Set(pulse_on ? 1.0f : 0.0f);
-      } else {
-        led_freeze.Set(freeze_active ? 1.0f : 0.0f);
-      }
+      // Normal: LED1 follows freeze, LED2 follows bypass. (~100 Hz, not audio.)
+      led_freeze.Set(freeze_active ? 1.0f : 0.0f);
       led_effect.Set(bypass ? 0.0f : 1.0f);
     }
     led_freeze.Update();
