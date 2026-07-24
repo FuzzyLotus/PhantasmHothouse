@@ -1020,7 +1020,29 @@ v0.7f: PASS (current shipped baseline — 2026-07-17)
 
 Note: `phantasm-hothouse-v0.8a` (FS1 hold-capture) was tried and retracted;
 that tag was deleted so it cannot be confused with a real v0.8 milestone.
-Next v0.8 work starts fresh from v0.7f.
+
+v0.8 (in progress): Soft Veil + dual FS1 release
+- FS1 while frozen: short tap = soft release; hold ~250 ms = emergency kill
+- FS1 while live: short tap = engage freeze (unchanged latch + K2 grace)
+- FS2: short tap = bypass; hold while frozen = Soft Veil (momentary expression)
+- Soft Veil (v0.8b): output-only multi-tap stacker — staggered freeze-loop reads
+  with decay ladder, slow drift, and diffusion fog; release returns to clean bed;
+  never writes into main_delay; live-over stays clear; SW3 DOWN gets more fog
+- SW3 modes unchanged
+
+Freeze release / kill fixes (v0.8c):
+- Emergency kill uses a raised-cosine wet fade (kKillFadeMs ~6 ms, zero-slope) —
+  click-free at any SPL — then clears main/live/rev buffers and snaps state.
+  kill_fade_gain is held at 0 through an ~80 ms write lockout, then ramped back to
+  unity (kKillRestoreCoeff) so the wet return lands on a settled/silent buffer
+  (fixes: click on kill, and delay never returning after kill).
+- Soft release melt shortened from ~2 s to ~450 ms (kFreezeReleaseCoeff 0.00018)
+  so read/feedback/write unlock together; new playing re-enters the delay in a few
+  hundred ms instead of being masked by a sustained bed.
+- Post-release dry write reopens progressively as the loop melts
+  (kReleaseWriteOpenHi/Lo) instead of a hard lockout.
+- K4 HOLD trim is held through the release melt (freeze_scale_latched) so a
+  K4-attenuated bed does not swell louder as it decays.
 
 Do not skip ahead unless explicitly instructed.
 

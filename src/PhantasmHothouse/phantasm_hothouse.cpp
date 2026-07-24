@@ -28,13 +28,14 @@
 // Switch row (mode / world selectors):
 //   SW1 FX     UP clean / MID filtered / DOWN filtered+space.
 //   SW2 DIR    UP forward / MID hybrid / DOWN reverse.  (v0.5: dual-grain reverse)
-//   SW3 HOLD   UP pure / MID live-over-freeze / DOWN absorb-bleed.
-//             (v0.7a: plumbed, all modes currently Pure Freeze)
-// Footswitches:
-//   FS1 HOLD   Freeze delay line toggle.        (v0.6: tap on / tap off)
-//   FS2 BYPASS Effect on/off.  (FS1+FS2 held ~3 s = bootloader)
+//   SW3 HOLD   UP pure / MID live-over / DOWN absorb (+ live-over).
+// Footswitches (v0.8):
+//   FS1 HOLD   Live: tap = freeze. Frozen: short tap = soft release;
+//              hold ~250 ms = emergency kill (fast melt).
+//   FS2        Short tap = bypass. Hold while frozen = Soft Veil (momentary
+//              expression stacker: multi-tap jumble over the bed). FS1+FS2 ~3 s = bootloader.
 // LEDs:
-//   LED1 HOLD   Hold/freeze status.
+//   LED1 HOLD   Off=live, solid=frozen, soft dim-pulse=Soft Veil.
 //   LED2 EFFECT Bypass/engaged status.
 //
 // DSP architecture: the clean delay (top row) is the CORE MEMORY. Filter,
@@ -50,6 +51,7 @@
 // #include "daisysp-lgpl.h"
 
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 
 #include "daisysp.h"
@@ -106,11 +108,41 @@ static constexpr float kFreezeFeedback = 0.999f;
 static constexpr float kAbsorbLiveWrite = 0.06f;        // post-grace live write in absorb
 static constexpr float kAbsorbFreezeFeedback = 0.996f;  // slightly < unity to make room
 
-// Asymmetric freeze ramp: engage is reasonably quick; release is slow so the
-// frozen bed melts gradually back into the normal delay instead of decaying in
-// stepped chunks. (fonepole coeff -> ~1/(coeff*fs) time constant at 48 kHz.)
+// Asymmetric freeze ramp: engage is reasonably quick; soft release melts the
+// bed and unlocks the read/feedback/write together. The release was ~2 s, which
+// held the loop near unity so the bed SUSTAINED and new playing could not enter
+// the delay for seconds. Now ~450 ms: quick enough that a tap-release becomes a
+// normal delay (frozen material decays via K3, new notes repeat immediately)
+// while still smooth. Emergency kill (FS1 hold while frozen) uses a fast wet
+// fade instead. (fonepole coeff -> ~1/(coeff*fs) at 48 kHz.)
 static constexpr float kFreezeEngageCoeff = 0.0010f;    // ~80 ms engage
-static constexpr float kFreezeReleaseCoeff = 0.00004f;  // ~2 s graceful melt
+static constexpr float kFreezeReleaseCoeff = 0.00018f;  // ~450 ms soft release
+// Emergency kill uses a short wet fade (kKillFadeMs) instead of these coeffs.
+
+// FS1 / FS2 hybrid timing (v0.8)
+static constexpr float kFs1HoldKillMs = 250.0f;          // soft vs kill threshold
+static constexpr float kFs2HoldVeilMs = 250.0f;          // bypass tap vs Soft Veil
+static constexpr uint32_t kFsDebounceSamples = 240;      // ~5 ms @ 48 kHz
+
+// Soft Veil (v0.8b): output-only expression stacker while FS2 held + frozen.
+// Multi-tap jumble of the locked freeze loop with decay ladder + diffusion fog.
+// Never writes into main_delay / feedback; release settles back to the clean bed.
+static constexpr float kVeilSmoothCoeff = 0.0005f;       // ~100 ms engage/release
+static constexpr float kVeilStackBlend = 0.70f;          // how far bed → stack wash
+static constexpr float kVeilDriftSamps = 64.0f;          // slow integer tap wander
+static constexpr float kVeilDriftInc = 0.000018f;        // ultra-slow drift LFO
+static constexpr float kVeilFogBase = 0.10f;             // extra diffusion while veiled
+static constexpr float kVeilFogDown = 0.06f;             // more fog on SW3 DOWN
+static constexpr float kVeilDiffMax = 0.22f;             // cap freeze-mask with fog
+// Tap positions as fractions of freeze_loop_samps (center + three staggered layers).
+static constexpr float kVeilTapFrac1 = 0.17f;
+static constexpr float kVeilTapFrac2 = 0.37f;
+static constexpr float kVeilTapFrac3 = 0.61f;
+// Decay ladder weights (sum ≈ 1) — denser ≠ louder clone.
+static constexpr float kVeilGain0 = 0.40f;
+static constexpr float kVeilGain1 = 0.28f;
+static constexpr float kVeilGain2 = 0.20f;
+static constexpr float kVeilGain3 = 0.12f;
 
 // FREEZE live-input write gate (v0.6.2a "Pure Hold With Grace"): decoupled from
 // s_freeze. When freeze engages, dry input keeps writing for one full delay loop
@@ -118,6 +150,11 @@ static constexpr float kFreezeReleaseCoeff = 0.00004f;  // ~2 s graceful melt
 // then fades out so playing over a freeze doesn't endlessly stack into the
 // near-unity loop. main_delay.Write() still runs every sample (feedback always).
 static constexpr float kLiveWriteFadeCoeff = 0.00015f;  // ~150 ms smooth live-input fade
+// Soft-release dry re-entry: reopen the write gate as the freeze loop melts.
+// Closed while s_freeze is still near unity (no write-into-unity buildup), fully
+// open once it drops below kReleaseWriteOpenLo (~a few hundred ms after release).
+static constexpr float kReleaseWriteOpenHi = 0.70f;  // s_freeze where dry write starts reopening
+static constexpr float kReleaseWriteOpenLo = 0.25f;  // s_freeze where dry write is fully open
 
 // FREEZE diffusion mask (v0.6.2d): a tiny freeze-ONLY audible allpass diffuser
 // mixed in very low to soften loop-seam perception. Output-only — never written
@@ -257,6 +294,13 @@ struct DelBuf {
     memset(buf, 0, n * sizeof(float));
   }
 
+  inline void Clear() {
+    if (buf != nullptr && len > 0) {
+      memset(buf, 0, len * sizeof(float));
+    }
+    wp = 0;
+  }
+
   inline void Write(float s) {
     buf[wp] = s;
     wp = (wp + 1) % len;
@@ -281,6 +325,16 @@ struct DelBuf {
     if (samps > len - 1) samps = len - 1;
     size_t r = (wp + len - samps) % len;  // wp - samps, wrapped
     return buf[r];
+  }
+
+  // Integer read with signed offset (Soft Veil stack taps; feedback stays ReadInt).
+  inline float ReadIntOffset(size_t samps, int offset_samps) const {
+    int s = static_cast<int>(samps) + offset_samps;
+    if (s < 1) s = 1;
+    if (s >= static_cast<int>(len) - 1) {
+      s = static_cast<int>(len) - 2;
+    }
+    return ReadInt(static_cast<size_t>(s));
   }
 };
 
@@ -403,11 +457,9 @@ Led led_freeze, led_effect;
 volatile bool bypass = true;
 volatile bool fs1_held = false;
 volatile bool fs2_held = false;
-volatile bool freeze_active = false;  // FS1 toggle: freeze the main delay line
-// SW3 HOLD mode (v0.7a plumbing). SW3 selects a future hold mode; in v0.7a ALL
-// positions behave as Pure Freeze. The mode + smoothed gates below are plumbed
-// for later milestones (v0.7b Absorb/Bleed, v0.7c Live-Over-Freeze) but are NOT
-// wired into any audio math yet, so there is zero audible change.
+volatile bool freeze_active = false;  // delay bed locked (Frozen)
+volatile bool soft_veil_active = false;  // FS2 Soft Veil held while frozen (LED)
+// SW3 HOLD mode. SW3 selects hold behavior while frozen.
 enum class HoldMode { kPure, kLiveOverFreeze, kAbsorbBleed };
 volatile HoldMode hold_mode = HoldMode::kPure;
 float knob_values[Hothouse::KNOB_LAST] = {};
@@ -421,6 +473,32 @@ float rev_fb = 0.0f;  // SPACE-layer reverb feedback (separate from clean loop)
 float live_write_gain = 1.0f;       // dry-input write gate (Pure Hold With Grace)
 float live_grace_remain = 0.0f;     // grace countdown in samples (audio thread only)
 size_t freeze_loop_samps = 2400;    // latched integer freeze loop length (audio thread only)
+bool kill_fade_active = false;      // emergency-kill wet fade in progress
+float kill_fade_gain = 1.0f;        // wet gain during kill fade (1 -> 0)
+float kill_fade_phase = 0.0f;       // 0 -> 1 fade progress (raised-cosine)
+float freeze_wet_scale = 1.0f;      // smoothed HOLD-level wet trim (persists across callbacks)
+float freeze_scale_latched = 1.0f;  // engaged trim, held through soft release
+float kill_write_lock_remain = 0.0f;  // keep live write closed briefly after kill
+static constexpr float kKillWriteLockMs = 80.0f;
+static constexpr float kKillFadeMs = 6.0f;  // fast wet fade-out on emergency kill
+static constexpr float kKillRestoreCoeff = 0.0007f;  // ~30 ms wet gain ramp back after kill
+static constexpr float kPi = 3.14159265358979323846f;  // raised-cosine kill taper
+
+enum class Fs1PressKind : uint8_t { kNone, kPending, kKill };
+enum class Fs2PressKind : uint8_t { kNone, kPending, kVeil };
+static uint32_t fs1_pressed_stable = 0;
+static uint32_t fs1_released_stable = 0;
+static bool fs1_debounced = false;
+static bool fs1_press_started_frozen = false;
+static Fs1PressKind fs1_press_kind = Fs1PressKind::kNone;
+static float fs1_press_samples = 0.0f;
+static uint32_t fs2_pressed_stable = 0;
+static uint32_t fs2_released_stable = 0;
+static bool fs2_debounced = false;
+static bool fs2_press_started_frozen = false;
+static Fs2PressKind fs2_press_kind = Fs2PressKind::kNone;
+static float fs2_press_samples = 0.0f;
+static float soft_veil_phase = 0.0f;
 
 // ============================================================
 // Smoothed parameters
@@ -443,12 +521,11 @@ Smoothed s_fwd_wet{1.0f, 1.0f, 0.0015f};       // SW2 DIR forward wet amount (cl
 Smoothed s_rev_wet{0.0f, 0.0f, 0.0015f};       // SW2 DIR reverse wet amount (click-free)
 Smoothed s_freeze_level{1.0f, 1.0f, 0.0010f};  // K4 HOLD frozen wet level
 Smoothed s_freeze{0.0f, 0.0f, 0.0010f};        // freeze engage/disengage (click-free, 0..1)
-// SW3 HOLD-mode gates (v0.7a plumbing): smoothed one-hot weights for the future
-// hold modes, kept warm so later wiring is click-free. Not used in audio yet —
-// all modes currently render as Pure Freeze, so these have zero audible effect.
+Smoothed s_veil{0.0f, 0.0f, kVeilSmoothCoeff}; // Soft Veil amount (output-only)
+// SW3 HOLD-mode gates: smoothed one-hot weights (pure / live-over / absorb).
 Smoothed s_hold_pure{1.0f, 1.0f, 0.0015f};     // SW3 UP weight (Pure Freeze)
-Smoothed s_hold_live{0.0f, 0.0f, 0.0015f};     // SW3 MIDDLE weight (reserved v0.7c)
-Smoothed s_hold_absorb{0.0f, 0.0f, 0.0015f};   // SW3 DOWN weight (reserved v0.7b)
+Smoothed s_hold_live{0.0f, 0.0f, 0.0015f};     // SW3 MIDDLE weight (live-over)
+Smoothed s_hold_absorb{0.0f, 0.0f, 0.0015f};   // SW3 DOWN weight (absorb)
 
 // ============================================================
 // K2 TIME — pad-focused piecewise curve
@@ -486,6 +563,42 @@ static inline void EqualPowerGains(float mix, float* dry_gain, float* wet_gain) 
   *wet_gain = sinf(angle);
 }
 
+static inline void EngageFreezeLatch() {
+  freeze_active = true;
+  kill_fade_active = false;
+  kill_fade_gain = 1.0f;
+  soft_veil_active = false;
+  soft_veil_phase = 0.0f;
+  freeze_loop_samps = static_cast<size_t>(
+      lroundf(fclamp(s_delay.current, 1.0f,
+                     static_cast<float>(kMaxDelay) - 2.0f)));
+  live_grace_remain = static_cast<float>(freeze_loop_samps);
+}
+
+static inline void SoftReleaseFreeze() {
+  freeze_active = false;
+  kill_fade_active = false;
+  soft_veil_active = false;
+  live_grace_remain = 0.0f;
+}
+
+static inline void KillReleaseFreeze() {
+  // True emergency kill: silence the held memory FAST but not instantly.
+  // A hard snap/clear cut the wet output at an arbitrary phase, which produced
+  // a one-sample step (audible pop). Instead we run a short wet fade
+  // (kKillFadeMs); the audio loop finalizes (clears buffers, snaps state) once
+  // kill_fade_gain reaches ~0.
+  freeze_active = false;
+  soft_veil_active = false;
+  soft_veil_phase = 0.0f;
+  live_grace_remain = 0.0f;
+  live_write_gain = 0.0f;
+  s_veil.target = 0.0f;
+  kill_fade_active = true;
+  kill_fade_gain = 1.0f;
+  kill_fade_phase = 0.0f;
+}
+
 static inline bool IsBad(float x) { return !std::isfinite(x); }
 
 // ============================================================
@@ -495,26 +608,116 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
                    size_t size) {
   hw.ProcessAllControls();
 
-  if (hw.switches[Hothouse::FOOTSWITCH_2].RisingEdge()) {
-    bypass = !bypass;
-  }
-  // FS1 is a toggle (not momentary): tap to freeze/unfreeze the main delay line.
-  if (hw.switches[Hothouse::FOOTSWITCH_1].RisingEdge()) {
-    freeze_active = !freeze_active;
-    if (freeze_active) {
-      // Latch an INTEGER loop length so the frozen forward bed/feedback can't
-      // wander (K2) or smear (fractional interpolation) while held.
-      freeze_loop_samps = static_cast<size_t>(
-          lroundf(fclamp(s_delay.current, 1.0f,
-                         static_cast<float>(kMaxDelay) - 2.0f)));
-      // Capture grace = one delay loop (scales with K2: 20–4000 ms).
-      live_grace_remain = static_cast<float>(freeze_loop_samps);
-    } else {
-      live_grace_remain = 0.0f;
+  // ----- FS1 (v0.8): tap engage / soft release; hold while frozen = kill -----
+  const bool fs1_raw = hw.switches[Hothouse::FOOTSWITCH_1].Pressed();
+  bool fs1_db_rise = false;
+  bool fs1_db_fall = false;
+  if (fs1_raw) {
+    fs1_released_stable = 0;
+    if (fs1_pressed_stable < kFsDebounceSamples) {
+      fs1_pressed_stable++;
+      if (fs1_pressed_stable == kFsDebounceSamples && !fs1_debounced) {
+        fs1_db_rise = true;
+        fs1_debounced = true;
+      }
+    }
+  } else {
+    fs1_pressed_stable = 0;
+    if (fs1_released_stable < kFsDebounceSamples) {
+      fs1_released_stable++;
+      if (fs1_released_stable == kFsDebounceSamples && fs1_debounced) {
+        fs1_db_fall = true;
+        fs1_debounced = false;
+      }
     }
   }
-  fs1_held = hw.switches[Hothouse::FOOTSWITCH_1].Pressed();
-  fs2_held = hw.switches[Hothouse::FOOTSWITCH_2].Pressed();
+
+  const float fs1_kill_thresh =
+      kFs1HoldKillMs * (sample_rate / 1000.0f);
+  if (fs1_db_rise) {
+    fs1_press_kind = Fs1PressKind::kPending;
+    fs1_press_started_frozen = freeze_active;
+    fs1_press_samples = 0.0f;
+  }
+  if (fs1_debounced && fs1_press_kind == Fs1PressKind::kPending) {
+    fs1_press_samples += 1.0f;
+    if (fs1_press_samples >= fs1_kill_thresh && fs1_press_started_frozen) {
+      fs1_press_kind = Fs1PressKind::kKill;
+      KillReleaseFreeze();
+    }
+  }
+  if (fs1_db_fall) {
+    if (fs1_press_kind == Fs1PressKind::kPending &&
+        fs1_press_samples < fs1_kill_thresh) {
+      if (fs1_press_started_frozen) {
+        SoftReleaseFreeze();
+      } else if (!freeze_active) {
+        EngageFreezeLatch();
+      }
+    }
+    fs1_press_kind = Fs1PressKind::kNone;
+    fs1_press_samples = 0.0f;
+  }
+
+  // ----- FS2 (v0.8): tap bypass; hold while frozen = Soft Veil -----
+  const bool fs2_raw = hw.switches[Hothouse::FOOTSWITCH_2].Pressed();
+  bool fs2_db_rise = false;
+  bool fs2_db_fall = false;
+  if (fs2_raw) {
+    fs2_released_stable = 0;
+    if (fs2_pressed_stable < kFsDebounceSamples) {
+      fs2_pressed_stable++;
+      if (fs2_pressed_stable == kFsDebounceSamples && !fs2_debounced) {
+        fs2_db_rise = true;
+        fs2_debounced = true;
+      }
+    }
+  } else {
+    fs2_pressed_stable = 0;
+    if (fs2_released_stable < kFsDebounceSamples) {
+      fs2_released_stable++;
+      if (fs2_released_stable == kFsDebounceSamples && fs2_debounced) {
+        fs2_db_fall = true;
+        fs2_debounced = false;
+      }
+    }
+  }
+
+  const float fs2_veil_thresh =
+      kFs2HoldVeilMs * (sample_rate / 1000.0f);
+  if (fs2_db_rise) {
+    fs2_press_kind = Fs2PressKind::kPending;
+    fs2_press_started_frozen = freeze_active;
+    fs2_press_samples = 0.0f;
+    soft_veil_active = false;
+  }
+  if (fs2_debounced && fs2_press_kind == Fs2PressKind::kPending) {
+    fs2_press_samples += 1.0f;
+    if (fs2_press_samples >= fs2_veil_thresh && fs2_press_started_frozen &&
+        freeze_active) {
+      fs2_press_kind = Fs2PressKind::kVeil;
+      soft_veil_active = true;
+    }
+  }
+  // Soft Veil stays on only while held and still frozen.
+  if (fs2_press_kind == Fs2PressKind::kVeil) {
+    soft_veil_active = freeze_active && fs2_debounced;
+    if (!soft_veil_active) {
+      fs2_press_kind = Fs2PressKind::kNone;
+    }
+  }
+  if (fs2_db_fall) {
+    if (fs2_press_kind == Fs2PressKind::kPending &&
+        fs2_press_samples < fs2_veil_thresh) {
+      bypass = !bypass;
+    }
+    soft_veil_active = false;
+    fs2_press_kind = Fs2PressKind::kNone;
+    fs2_press_samples = 0.0f;
+  }
+
+  fs1_held = fs1_debounced;
+  fs2_held = fs2_debounced;
 
   for (size_t i = 0; i < Hothouse::KNOB_LAST; ++i) {
     knob_values[i] = hw.GetKnobValue(static_cast<Hothouse::Knob>(i));
@@ -558,10 +761,9 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
   // K4 sets the frozen wet level applied while freeze is engaged.
   s_freeze_level.target = fclamp(knob_values[Hothouse::KNOB_4], 0.0f, 1.0f);
   s_freeze.target = freeze_active ? 1.0f : 0.0f;
+  s_veil.target = (soft_veil_active && freeze_active) ? 1.0f : 0.0f;
 
-  // SW3 HOLD mode select (v0.7a PLUMBING ONLY). Map SW3 to a mode + one-hot gate
-  // targets for future milestones. These DO NOT affect audio yet — every mode is
-  // still rendered as Pure Freeze below — so switching SW3 is silent/zero-change.
+  // SW3 HOLD mode select: UP pure / MID live-over / DOWN absorb.
   switch (toggle_positions[2]) {
     case Hothouse::TOGGLESWITCH_MIDDLE:
       hold_mode = HoldMode::kLiveOverFreeze;
@@ -597,13 +799,11 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
     s_fwd_wet.Tick();
     s_rev_wet.Tick();
     s_freeze_level.Tick();
-    // SW3 hold-mode gates (v0.7a): ticked to stay click-free for later wiring;
-    // their .current is intentionally not read anywhere yet (zero audible change).
     s_hold_pure.Tick();
     s_hold_live.Tick();
     s_hold_absorb.Tick();
-    // Asymmetric freeze smoothing: quick engage toward 1.0, slow melt toward 0.0
-    // so turning freeze OFF lets the bed decay gracefully rather than in steps.
+    s_veil.Tick();
+    // Asymmetric freeze smoothing: quick engage; soft melt toward 0.
     {
       const float freeze_coeff = (s_freeze.target > s_freeze.current)
                                      ? kFreezeEngageCoeff
@@ -611,25 +811,84 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
       fonepole(s_freeze.current, s_freeze.target, freeze_coeff);
     }
 
+    // Emergency kill: fast wet fade-out, then finalize (clear + snap state).
+    // Raised-cosine (Hann) taper: gain = 0.5*(1+cos(pi*phase)) goes 1 -> 0 with
+    // ZERO slope at both ends. Unlike a linear ramp it has no corners, so there
+    // is no slope discontinuity to radiate a click even at very high SPL. The
+    // frozen bed stays present during the fade so this gain does all the muting.
+    if (kill_fade_active) {
+      const float kill_step = 1.0f / (kKillFadeMs * (sample_rate / 1000.0f));
+      kill_fade_phase += kill_step;
+      if (kill_fade_phase >= 1.0f) {
+        kill_fade_phase = 1.0f;
+        kill_fade_active = false;
+        // Leave kill_fade_gain at ~0 here; it is ramped back to unity below AFTER
+        // the write lockout (buffers empty + filter tails settled). Snapping it to
+        // 1.0 in this same sample multiplied the still-decaying tone/reverse/filter
+        // one-pole state (buffer clear does NOT reset those) and clicked.
+        kill_fade_gain = 0.0f;
+        // Now safe to silence the memory: output is already at zero gain.
+        s_freeze.target = 0.0f;
+        s_freeze.current = 0.0f;
+        s_veil.target = 0.0f;
+        s_veil.current = 0.0f;
+        fb_sig = 0.0f;
+        rev_fb = 0.0f;
+        live_write_gain = 0.0f;
+        main_delay.Clear();
+        live_delay.Clear();
+        // Also clear the SPACE buffer: its fixed read taps would otherwise keep
+        // returning stale (loud) content that re-emerges once kill_fade_gain is
+        // restored to 1.0 while SW1 is DOWN.
+        rev_delay.Clear();
+        kill_write_lock_remain = kKillWriteLockMs * (sample_rate / 1000.0f);
+      } else {
+        kill_fade_gain = 0.5f * (1.0f + cosf(kPi * kill_fade_phase));
+      }
+    }
+
     // Live-input write gate (Pure Hold With Grace), DECOUPLED from s_freeze.
     // s_freeze still drives feedback ramp/crossfade and wet scaling; this only
     // controls whether new dry input enters the delay memory. On freeze ON the
-    // dry keeps writing for one delay loop (K2-scaled grace) then fades to 0
-    // (so playing over the freeze doesn't endlessly stack). On freeze OFF it
-    // returns to 1.0 so normal playing writes fully again.
+    // dry keeps writing for one delay loop (K2-scaled grace) then fades to 0.
+    // On SOFT RELEASE the write reopens PROGRESSIVELY as the loop melts (see
+    // below): closed while the loop is still near unity (avoids write-into-unity
+    // buildup), then open as feedback drops so new playing enters again quickly.
+    // Emergency kill has its own hard lockout (kill_write_lock_remain).
     float live_write_target;
-    if (!freeze_active) {
-      live_write_target = 1.0f;
-    } else if (live_grace_remain > 0.0f) {
-      live_write_target = 1.0f;
-      live_grace_remain -= 1.0f;
+    if (kill_write_lock_remain > 0.0f) {
+      live_write_target = 0.0f;
+      kill_write_lock_remain -= 1.0f;
+    } else if (freeze_active) {
+      if (live_grace_remain > 0.0f) {
+        live_write_target = 1.0f;
+        live_grace_remain -= 1.0f;
+      } else {
+        live_write_target = kAbsorbLiveWrite * s_hold_absorb.current;
+      }
+    } else if (s_freeze.current > 0.02f) {
+      live_write_target =
+          fclamp((kReleaseWriteOpenHi - s_freeze.current) /
+                     (kReleaseWriteOpenHi - kReleaseWriteOpenLo),
+                 0.0f, 1.0f);
     } else {
-      // After grace: Pure Freeze (UP/MIDDLE) closes live input to 0. Absorb/Bleed
-      // (SW3 DOWN) instead lets a small amount keep bleeding into the frozen
-      // memory, scaled by the smoothed absorb gate so the change is click-free.
-      live_write_target = kAbsorbLiveWrite * s_hold_absorb.current;
+      live_write_target = 1.0f;
     }
-    fonepole(live_write_gain, live_write_target, kLiveWriteFadeCoeff);
+    // After kill, keep gain hard-closed until lockout ends (skip slow fade-up race).
+    if (kill_write_lock_remain > 0.0f) {
+      live_write_gain = 0.0f;
+    } else {
+      fonepole(live_write_gain, live_write_target, kLiveWriteFadeCoeff);
+    }
+
+    // Restore the wet gain after an emergency kill: ramp back to unity only once
+    // the write lockout has expired (buffers empty, filter tails settled), so the
+    // return is click-free. Normal operation keeps kill_fade_gain == 1.0 (no-op).
+    if (!kill_fade_active && kill_write_lock_remain <= 0.0f &&
+        kill_fade_gain < 1.0f) {
+      fonepole(kill_fade_gain, 1.0f, kKillRestoreCoeff);
+      if (kill_fade_gain > 0.9995f) kill_fade_gain = 1.0f;
+    }
 
     // ----- Phantasmagoria-style custom DelBuf engine (clean core) -----
     // Write (gated dry) + feedback; gently saturate the write when feedback is
@@ -842,19 +1101,64 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
     } else {
       freeze_level = 1.0f + (k4 - 0.5f); // 1.0 -> 1.5 over the upper half
     }
-    const float freeze_wet_scale =
-        1.0f + (freeze_level - 1.0f) * s_freeze.current;
+    // Wet HOLD-level trim. On ENGAGE it rides s_freeze from unity to freeze_level
+    // (K2-independent, click-free). On SOFT RELEASE we must NOT let it climb back
+    // toward unity: with K4 below noon the bed is trimmed quiet, and letting the
+    // multiplier spring back to 1.0 while the tail is still audible made the decay
+    // get LOUDER (the reported volume boost). So hold the engaged trim through the
+    // melt and relax to unity only once the bed is essentially gone (inaudible).
+    if (freeze_active) {
+      freeze_wet_scale = 1.0f + (freeze_level - 1.0f) * s_freeze.current;
+      freeze_scale_latched = freeze_wet_scale;
+    } else if (s_freeze.current > 0.02f) {
+      freeze_wet_scale = freeze_scale_latched;
+    } else {
+      fonepole(freeze_wet_scale, 1.0f, kFreezeEngageCoeff);
+    }
 
-    // FREEZE diffusion mask (v0.6.2d): output-only allpass blend that fades in
-    // with s_freeze^2 (0 when not frozen, <=5% when fully held). It softens the
-    // perception of a hard loop seam without touching the freeze loop, feedback,
-    // reverse, filter, or space. The allpass runs every sample (continuous state)
-    // but is mixed in only by the freeze-scaled amount.
-    const float diffused = freeze_diffuser.Process(delay_plus_space);
-    const float freeze_mask_amt =
+    // Soft Veil stacker (v0.8b): output-only multi-tap jumble of the locked freeze
+    // loop. Crossfade bed wet toward stacked taps + heavier diffusion. Never
+    // writes into main_delay / feedback; live-over stays clear on top.
+    const float veil_amt = s_veil.current * s_freeze.current;
+    float pre_diff = delay_plus_space;
+    if (veil_amt > 0.001f && freeze_loop_samps > 1) {
+      soft_veil_phase += kVeilDriftInc;
+      if (soft_veil_phase >= 1.0f) soft_veil_phase -= 1.0f;
+      const float drift_sin = sinf(kTwoPi * soft_veil_phase);
+      const float drift = drift_sin * kVeilDriftSamps * veil_amt;
+      const float loop_f = static_cast<float>(freeze_loop_samps);
+      // Negative offsets = earlier phases inside the locked loop (+ slow drift).
+      const int off1 =
+          -static_cast<int>(kVeilTapFrac1 * loop_f) + static_cast<int>(drift);
+      const int off2 = -static_cast<int>(kVeilTapFrac2 * loop_f) -
+                       static_cast<int>(drift * 0.7f);
+      const int off3 = -static_cast<int>(kVeilTapFrac3 * loop_f) +
+                       static_cast<int>(drift * 0.45f);
+      const float t0 = main_delay.ReadInt(freeze_loop_samps);
+      const float t1 = main_delay.ReadIntOffset(freeze_loop_samps, off1);
+      const float t2 = main_delay.ReadIntOffset(freeze_loop_samps, off2);
+      const float t3 = main_delay.ReadIntOffset(freeze_loop_samps, off3);
+      float stack = t0 * kVeilGain0 + t1 * kVeilGain1 + t2 * kVeilGain2 +
+                    t3 * kVeilGain3;
+      stack = gentle_saturate(stack);
+      if (IsBad(stack)) stack = t0;
+      const float blend = veil_amt * kVeilStackBlend;
+      pre_diff = delay_plus_space * (1.0f - blend) + stack * blend;
+    } else if (s_veil.current < 0.001f) {
+      soft_veil_phase = 0.0f;
+    }
+
+    // FREEZE diffusion mask: base seam softener + Soft Veil fog (more on SW3 DOWN).
+    const float diffused = freeze_diffuser.Process(pre_diff);
+    float freeze_mask_amt =
         kFreezeDiffusionMix * s_freeze.current * s_freeze.current;
+    if (veil_amt > 0.001f) {
+      freeze_mask_amt += kVeilFogBase * veil_amt;
+      freeze_mask_amt += kVeilFogDown * veil_amt * s_hold_absorb.current;
+      freeze_mask_amt = fclamp(freeze_mask_amt, 0.0f, kVeilDiffMax);
+    }
     float wet_to_mix =
-        delay_plus_space * (1.0f - freeze_mask_amt) + diffused * freeze_mask_amt;
+        pre_diff * (1.0f - freeze_mask_amt) + diffused * freeze_mask_amt;
     if (IsBad(wet_to_mix)) wet_to_mix = delay_plus_space;
 
     // Constant-power dry/wet mix; pure dry at K1 minimum.
@@ -865,14 +1169,14 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
       float dry_gain = 1.0f;
       float wet_gain = 0.0f;
       EqualPowerGains(s_mix.current, &dry_gain, &wet_gain);
-      out_mono = dry * dry_gain + wet_to_mix * (wet_gain * freeze_wet_scale);
-      // Live Delay Over Freeze (v0.7c+): live_direction_voice follows SW2 DIR.
-      // Audible on SW3 MIDDLE and SW3 DOWN (absorb still bleeds into main_delay).
-      // Added AFTER freeze_wet_scale so K4 trims only the frozen bed.
+      // kill_fade_gain (1.0 normally) fades the wet/held bed on emergency kill.
+      out_mono = dry * dry_gain +
+                 wet_to_mix * (wet_gain * freeze_wet_scale * kill_fade_gain);
+      // Live Delay Over Freeze: stays clear on top of Soft Veil stack wash.
       const float live_over_gate =
           fmaxf(s_hold_live.current, s_hold_absorb.current);
       const float live_gain = s_freeze.current * live_over_gate;
-      out_mono += live_direction_voice * (wet_gain * live_gain);
+      out_mono += live_direction_voice * (wet_gain * live_gain * kill_fade_gain);
     }
 
     if (IsBad(out_mono)) out_mono = dry;
@@ -957,8 +1261,14 @@ int main() {
       led_freeze.Set(lvl);
       led_effect.Set(lvl);
     } else {
-      // Normal: LED1 follows freeze, LED2 follows bypass. (~100 Hz, not audio.)
-      led_freeze.Set(freeze_active ? 1.0f : 0.0f);
+      // Normal: LED1 follows freeze (soft dim-pulse during Soft Veil), LED2 bypass.
+      if (soft_veil_active && freeze_active) {
+        const float pulse =
+            0.55f + 0.45f * (0.5f + 0.5f * sinf(soft_veil_phase * kTwoPi));
+        led_freeze.Set(pulse);
+      } else {
+        led_freeze.Set(freeze_active ? 1.0f : 0.0f);
+      }
       led_effect.Set(bypass ? 0.0f : 1.0f);
     }
     led_freeze.Update();
