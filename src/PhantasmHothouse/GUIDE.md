@@ -81,10 +81,39 @@ update mode. FS1 by itself never does this, because FS1 is a performance control
 - LED1 HOLD: On when freeze is active, off when it is not.
 - LED2 EFFECT: Effect state indicator.
 
-## Updating the firmware
+## Flashing for the first time (blank Daisy Seed)
 
-The firmware file to flash is `phantasm_hothouse.bin`. Put the pedal into update
-mode using the FS1 plus FS2 hold described above, then load the `.bin` over DFU.
+If the Daisy Seed is blank or is running different firmware, the FS1 plus FS2
+footswitch combo will not work yet, because that combo depends on this firmware
+already running. On a blank board you enter update mode with the two small
+buttons on the Daisy Seed itself.
+
+The two buttons on the Daisy Seed are BOOT and RESET.
+
+1. Connect the Daisy Seed to your computer with a USB cable that carries data.
+2. Put the board into DFU mode with the buttons:
+   - Press and hold the BOOT button.
+   - While still holding BOOT, press and release the RESET button.
+   - Release the BOOT button.
+   The board is now waiting in DFU mode. Your computer should see a device named
+   something like STM32 BOOTLOADER.
+3. Send the firmware. You have two easy options:
+   - Web programmer: open the Daisy web programmer in a supported browser, connect
+     to the board, and upload `phantasm_hothouse.bin`.
+   - Command line: from the project, run `make -C src/PhantasmHothouse program-dfu`.
+     This uses dfu-util to write the firmware, so dfu-util needs to be installed.
+4. When the write finishes, the pedal restarts and runs PhantasmHothouse. The
+   LEDs and footswitches behave as described in this guide.
+
+You only need the button method for the very first flash or if the board ever
+gets into a state where the firmware is not running. After PhantasmHothouse is
+installed, later updates can use the FS1 plus FS2 combo instead of the buttons.
+
+## Updating the firmware later
+
+Once the pedal already runs PhantasmHothouse, put it into update mode using the
+FS1 plus FS2 hold described above, then load `phantasm_hothouse.bin` over DFU with
+either the web programmer or `make -C src/PhantasmHothouse program-dfu`.
 
 If you are building from source, the commands are:
 
