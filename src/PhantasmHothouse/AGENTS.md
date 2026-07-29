@@ -1025,9 +1025,17 @@ v0.8 (in progress): Soft Veil + dual FS1 release
 - FS1 while frozen: short tap = soft release; hold ~250 ms = emergency kill
 - FS1 while live: short tap = engage freeze (unchanged latch + K2 grace)
 - FS2: short tap = bypass; hold while frozen = Soft Veil (momentary expression)
-- Soft Veil (v0.8b): output-only multi-tap stacker — staggered freeze-loop reads
-  with decay ladder, slow drift, and diffusion fog; release returns to clean bed;
-  never writes into main_delay; live-over stays clear; SW3 DOWN gets more fog
+- Soft Veil (v0.8f): momentary parallel delay bloom (Floyd-warm damped regen
+  near unity + Radiohead multi-tap/diffusion smear); never writes main_delay;
+  soft sat + dark LPF keep self-oscillation musical; live-over stays clear;
+  more haunted on SW3 DOWN
+- Soft Veil plateau (v0.8f): envelope-tracked feedback pull-back (kVeilCeil) so a
+  >1 loop gain builds then SETTLES instead of pinning the limiter. Long holds used
+  to run into the ceiling and read as clipping.
+- soft_clip(): continuous soft ceiling (unity slope under 0.7, asymptote 1.0). Do
+  NOT go back to `if (|x| > k) x = fast_tanh(x*a)*b` — that shape is discontinuous
+  at the knee and glitches every time a growing signal crosses it. Note
+  gentle_saturate() asymptotes at 2.8, so it shapes but does not limit.
 - SW3 modes unchanged
 
 Freeze release / kill fixes (v0.8c):

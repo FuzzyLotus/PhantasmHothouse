@@ -26,7 +26,7 @@ Pad-focused delay with parallel filter, space, reverse direction, and delay-line
 | SWITCH 2 | DIR | **UP** forward / **MID** hybrid / **DOWN** reverse |
 | SWITCH 3 | HOLD | **UP** pure freeze / **MID** live-over / **DOWN** absorb + live-over |
 | FOOTSWITCH 1 | HOLD | Live: tap = freeze. Frozen: short tap = soft release; hold ~250 ms = kill |
-| FOOTSWITCH 2 | Bypass / Soft Veil | Short tap = bypass. Hold while frozen = expression stacker (temporary jumble) |
+| FOOTSWITCH 2 | Bypass / Soft Veil | Short tap = bypass. Hold while frozen = delay bloom (warm stack / soft self-osc) |
 | FS1 + FS2 | Bootloader | Hold both ~3 s |
 
 ### Build

@@ -69,9 +69,10 @@ Bottom row:
 
 - FS2 BYPASS:
   - Tap: toggles bypass. When bypassed the output is your dry signal only.
-  - Hold while frozen: this is meant to be the Soft Veil expression control.
-    Please note this hold behavior is not working as intended right now. It will
-    be addressed in the next pass. For now, use FS2 as a normal bypass tap.
+  - Hold while frozen: Soft Veil. The frozen bed blooms into a warm, smeared
+    delay cloud (stacking / soft self-oscillation). Release and the bloom fades
+    while the locked freeze underneath stays. Live delay over freeze
+    (SW3 MIDDLE/DOWN) keeps playing normally on top.
 
 Bootloader: holding FS1 and FS2 together for about 3 seconds puts the pedal into
 update mode. FS1 by itself never does this, because FS1 is a performance control.
@@ -128,8 +129,6 @@ The built file lands in `src/PhantasmHothouse/build/phantasm_hothouse.bin`.
 
 This is a work in progress. The items below are known and planned.
 
-- FS2 hold Soft Veil: the hold expression on FS2 does not behave correctly yet.
-  This is the top item for the next pass.
 - Optimization pass: enable flush to zero for denormals to avoid rare processing
   spikes on long fades, reduce some per sample math, and review the output
   headroom limit. These are planned and were set aside to fix the freeze bugs first.

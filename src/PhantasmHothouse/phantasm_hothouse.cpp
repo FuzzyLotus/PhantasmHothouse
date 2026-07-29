@@ -33,7 +33,7 @@
 //   FS1 HOLD   Live: tap = freeze. Frozen: short tap = soft release;
 //              hold ~250 ms = emergency kill (fast melt).
 //   FS2        Short tap = bypass. Hold while frozen = Soft Veil (momentary
-//              expression stacker: multi-tap jumble over the bed). FS1+FS2 ~3 s = bootloader.
+//              Floyd/Radiohead delay bloom). FS1+FS2 ~3 s = bootloader.
 // LEDs:
 //   LED1 HOLD   Off=live, solid=frozen, soft dim-pulse=Soft Veil.
 //   LED2 EFFECT Bypass/engaged status.
@@ -124,25 +124,52 @@ static constexpr float kFs1HoldKillMs = 250.0f;          // soft vs kill thresho
 static constexpr float kFs2HoldVeilMs = 250.0f;          // bypass tap vs Soft Veil
 static constexpr uint32_t kFsDebounceSamples = 240;      // ~5 ms @ 48 kHz
 
-// Soft Veil (v0.8b): output-only expression stacker while FS2 held + frozen.
-// Multi-tap jumble of the locked freeze loop with decay ladder + diffusion fog.
-// Never writes into main_delay / feedback; release settles back to the clean bed.
-static constexpr float kVeilSmoothCoeff = 0.0005f;       // ~100 ms engage/release
-static constexpr float kVeilStackBlend = 0.70f;          // how far bed → stack wash
-static constexpr float kVeilDriftSamps = 64.0f;          // slow integer tap wander
-static constexpr float kVeilDriftInc = 0.000018f;        // ultra-slow drift LFO
-static constexpr float kVeilFogBase = 0.10f;             // extra diffusion while veiled
-static constexpr float kVeilFogDown = 0.06f;             // more fog on SW3 DOWN
-static constexpr float kVeilDiffMax = 0.22f;             // cap freeze-mask with fog
-// Tap positions as fractions of freeze_loop_samps (center + three staggered layers).
-static constexpr float kVeilTapFrac1 = 0.17f;
-static constexpr float kVeilTapFrac2 = 0.37f;
-static constexpr float kVeilTapFrac3 = 0.61f;
-// Decay ladder weights (sum ≈ 1) — denser ≠ louder clone.
-static constexpr float kVeilGain0 = 0.40f;
+// Soft Veil (v0.8e): momentary parallel delay bloom while FS2 held + frozen.
+// Pink Floyd warmth (dark damped regen near unity) + Radiohead smear (multi-tap
+// + diffusion). Never writes into main_delay; release lets the bloom decay out
+// and the locked freeze underneath remains. Live-over stays clear on top.
+static constexpr float kVeilSmoothCoeff = 0.00025f;  // ~250 ms engage/release
+static constexpr size_t kVeilSize = 48000;           // 1.0 s parallel tank @ 48 kHz
+static constexpr size_t kVeilDiffSize = 2048;
+static constexpr size_t kVeilDiffDelay = 677;        // ~14 ms diffuser
+static constexpr float kVeilDiffGain = 0.62f;
+// Regen lap length: derived from the freeze loop but halved until it fits under
+// kVeilMaxLenMs, so the bloom stays loop-synced AND builds fast enough to hear.
+static constexpr float kVeilMaxLenMs = 500.0f;
+static constexpr float kVeilMinLenMs = 90.0f;
+// GAIN BUDGET (do not lower kVeilFbBloom without redoing this): the damp LPF and
+// de-rumble HPF sit INSIDE the regen loop, so each costs gain even in the pass
+// band. At the band centre (geometric mean of the two corners) the pair passes
+// only ~0.977, so the feedback must clear that loss to build at all. A previous
+// pass used 1.05 with 2000/110 Hz corners, which netted ~0.996 loop gain: below
+// unity everywhere, so nothing ever bloomed. Wider corners keep the loss small.
+static constexpr float kVeilDampHz = 3000.0f;   // darken every regen lap (Floyd warmth)
+static constexpr float kVeilHpHz = 70.0f;       // keep the bloom from rumbling
+static constexpr float kVeilFbIdle = 0.60f;     // tank decays away when not held
+static constexpr float kVeilFbBloom = 1.14f;    // ~1.11 net loop gain: audible build
+static constexpr float kVeilInject = 0.75f;     // bed into the tank
+// Bloom plateau: track the tank envelope and ease feedback back toward unity as
+// it approaches the ceiling, so self-oscillation SETTLES instead of pinning the
+// clipper (which sounded like clipping/glitching rather than a warm plateau).
+static constexpr float kVeilCeil = 0.55f;       // envelope the bloom settles around
+static constexpr float kVeilEnvAtk = 0.002f;    // ~10 ms envelope attack
+static constexpr float kVeilEnvRel = 0.0002f;   // ~100 ms envelope release
+static constexpr float kVeilFbFloor = 0.90f;    // never collapse the bloom entirely
+static constexpr float kVeilPrime = 0.25f;      // keep tank primed while frozen (instant bloom)
+static constexpr float kVeilAdd = 0.95f;        // bloom ADDED on top of the bed
+static constexpr float kVeilBedTrim = 0.20f;    // slight bed duck so it thickens, not just louder
+static constexpr float kVeilDiffMix = 0.40f;    // smear amount at full hold
+static constexpr float kVeilFogDown = 0.12f;    // extra smear on SW3 DOWN
+// Output-only smear taps as fractions of the regen lap (stacking density).
+static constexpr float kVeilTapFrac1 = 0.81f;
+static constexpr float kVeilTapFrac2 = 0.59f;
+static constexpr float kVeilTapFrac3 = 0.33f;
+static constexpr float kVeilGain0 = 0.42f;
 static constexpr float kVeilGain1 = 0.28f;
 static constexpr float kVeilGain2 = 0.20f;
-static constexpr float kVeilGain3 = 0.12f;
+static constexpr float kVeilGain3 = 0.14f;
+static constexpr float kVeilDriftSamps = 60.0f;   // slow ghost tap wander
+static constexpr float kVeilPhaseInc = 0.000012f; // slow LED / ghost drift LFO
 
 // FREEZE live-input write gate (v0.6.2a "Pure Hold With Grace"): decoupled from
 // s_freeze. When freeze engages, dry input keeps writing for one full delay loop
@@ -238,6 +265,18 @@ static inline float gentle_saturate(float x) {
   if (ax < 0.8f) return x;
   float sign = (x >= 0.0f) ? 1.0f : -1.0f;
   return sign * (0.8f + (ax - 0.8f) / (1.0f + (ax - 0.8f) * 0.5f));
+}
+
+// Continuous soft clipper: unity slope below the knee, smooth above, asymptotes
+// at 1.0. Unlike a thresholded `if (|x| > k) x = fast_tanh(...)`, this has NO step
+// at the knee. That threshold shape is discontinuous (at k it jumps from k down to
+// k/(1+k/2)), which glitched audibly every time the Soft Veil bloom crossed it.
+// Also note gentle_saturate() asymptotes at 2.8, so it is a shaper, not a ceiling.
+static inline float soft_clip(float x) {
+  const float ax = fabsf(x);
+  if (ax < 0.7f) return x;
+  const float sign = (x >= 0.0f) ? 1.0f : -1.0f;
+  return sign * (1.0f - 0.3f / (1.0f + (ax - 0.7f) * (1.0f / 0.3f)));
 }
 
 static inline float LogLerpMs(float min_ms, float max_ms, float t) {
@@ -430,6 +469,8 @@ static float DSY_SDRAM_BSS main_buf[kMaxDelay];
 static float DSY_SDRAM_BSS rev_buf[kRevSize];
 static float DSY_SDRAM_BSS freeze_diff_buf[kFreezeDiffSize];
 static float DSY_SDRAM_BSS live_buf[kLiveDelaySize];  // SW3 MIDDLE live delay (v0.7c)
+static float DSY_SDRAM_BSS veil_buf[kVeilSize];       // Soft Veil parallel bloom tank
+static float DSY_SDRAM_BSS veil_diff_buf[kVeilDiffSize];
 
 Hothouse hw;
 DelBuf main_delay;
@@ -450,6 +491,12 @@ ReverseGrainReader live_reverse_reader;  // SW2 DIR on live_delay (output-only, 
 Lp1 live_reverse_lp;                   // separate tone state from frozen-bed reverse
 Lp1 live_reverse_smooth;               // separate smooth state from frozen-bed reverse
 Hp1 live_reverse_sum_hp;               // hybrid low-end fix on live reverse sum
+DelBuf veil_delay;                     // Soft Veil parallel regen tank (v0.8e)
+Allpass veil_diffuser;                 // Soft Veil smear diffuser
+Lp1 veil_damp;                         // darken each bloom lap
+Hp1 veil_hp;                           // de-rumble the bloom
+float veil_len_samps = 12000.0f;       // latched regen lap length (audio thread only)
+float veil_env = 0.0f;                 // Soft Veil tank envelope (bloom plateau AGC)
 
 // Hardware state retained for later DSP milestones.
 Led led_freeze, led_effect;
@@ -573,6 +620,16 @@ static inline void EngageFreezeLatch() {
       lroundf(fclamp(s_delay.current, 1.0f,
                      static_cast<float>(kMaxDelay) - 2.0f)));
   live_grace_remain = static_cast<float>(freeze_loop_samps);
+  // Latch the Soft Veil regen lap: keep it loop-synced by halving (loop, loop/2,
+  // loop/4 ...) until it is short enough that the bloom audibly builds.
+  {
+    float vl = static_cast<float>(freeze_loop_samps);
+    const float vmax = kVeilMaxLenMs * (sample_rate / 1000.0f);
+    const float vmin = kVeilMinLenMs * (sample_rate / 1000.0f);
+    while (vl > vmax) vl *= 0.5f;
+    if (vl < vmin) vl = vmin;
+    veil_len_samps = fclamp(vl, 1.0f, static_cast<float>(kVeilSize) - 8.0f);
+  }
 }
 
 static inline void SoftReleaseFreeze() {
@@ -841,6 +898,8 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
         // returning stale (loud) content that re-emerges once kill_fade_gain is
         // restored to 1.0 while SW1 is DOWN.
         rev_delay.Clear();
+        veil_delay.Clear();
+        veil_env = 0.0f;
         kill_write_lock_remain = kKillWriteLockMs * (sample_rate / 1000.0f);
       } else {
         kill_fade_gain = 0.5f * (1.0f + cosf(kPi * kill_fade_phase));
@@ -1116,49 +1175,85 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
       fonepole(freeze_wet_scale, 1.0f, kFreezeEngageCoeff);
     }
 
-    // Soft Veil stacker (v0.8b): output-only multi-tap jumble of the locked freeze
-    // loop. Crossfade bed wet toward stacked taps + heavier diffusion. Never
-    // writes into main_delay / feedback; live-over stays clear on top.
+    // Soft Veil bloom (v0.8e): parallel damped regen tank — warm near-unity
+    // stack/self-oscillate with multi-tap smear + diffusion. Output-only: never
+    // writes into main_delay. Peaks soft-limited so the gesture thickens rather
+    // than cliffs in level. Live-over stays clear on top.
     const float veil_amt = s_veil.current * s_freeze.current;
-    float pre_diff = delay_plus_space;
-    if (veil_amt > 0.001f && freeze_loop_samps > 1) {
-      soft_veil_phase += kVeilDriftInc;
+    float wet_bed = delay_plus_space;
+    {
+      soft_veil_phase += kVeilPhaseInc;
       if (soft_veil_phase >= 1.0f) soft_veil_phase -= 1.0f;
-      const float drift_sin = sinf(kTwoPi * soft_veil_phase);
-      const float drift = drift_sin * kVeilDriftSamps * veil_amt;
-      const float loop_f = static_cast<float>(freeze_loop_samps);
-      // Negative offsets = earlier phases inside the locked loop (+ slow drift).
-      const int off1 =
-          -static_cast<int>(kVeilTapFrac1 * loop_f) + static_cast<int>(drift);
-      const int off2 = -static_cast<int>(kVeilTapFrac2 * loop_f) -
-                       static_cast<int>(drift * 0.7f);
-      const int off3 = -static_cast<int>(kVeilTapFrac3 * loop_f) +
-                       static_cast<int>(drift * 0.45f);
-      const float t0 = main_delay.ReadInt(freeze_loop_samps);
-      const float t1 = main_delay.ReadIntOffset(freeze_loop_samps, off1);
-      const float t2 = main_delay.ReadIntOffset(freeze_loop_samps, off2);
-      const float t3 = main_delay.ReadIntOffset(freeze_loop_samps, off3);
-      float stack = t0 * kVeilGain0 + t1 * kVeilGain1 + t2 * kVeilGain2 +
-                    t3 * kVeilGain3;
-      stack = gentle_saturate(stack);
-      if (IsBad(stack)) stack = t0;
-      const float blend = veil_amt * kVeilStackBlend;
-      pre_diff = delay_plus_space * (1.0f - blend) + stack * blend;
-    } else if (s_veil.current < 0.001f) {
-      soft_veil_phase = 0.0f;
+
+      const float max_read = static_cast<float>(kVeilSize) - 4.0f;
+      const float len = fclamp(veil_len_samps, 1.0f, max_read);
+
+      // REGEN: exactly ONE feedback tap so the loop gain is predictable. Feeding
+      // all the smear taps back made the effective gain < 1 (tap spread + allpass
+      // cancellation), so nothing ever built. The damping LPF sits inside the
+      // loop, so every lap gets darker: warm bloom instead of bright howl.
+      const float fb_read = veil_delay.Read(len);
+      const float damped = veil_hp.Process(veil_damp.Process(fb_read));
+
+      // PLATEAU: loop gain above unity has to be walked back or the tank just
+      // runs into the limiter and stays there, which reads as clipping. Track the
+      // tank envelope and scale feedback proportionally once it passes kVeilCeil,
+      // so the bloom builds, then settles just under the ceiling and holds.
+      const float env_in = fabsf(fb_read);
+      fonepole(veil_env, env_in,
+               env_in > veil_env ? kVeilEnvAtk : kVeilEnvRel);
+      float fb_gain = kVeilFbIdle * (1.0f - veil_amt) + kVeilFbBloom * veil_amt;
+      if (veil_env > kVeilCeil) {
+        fb_gain *= kVeilCeil / veil_env;
+        if (fb_gain < kVeilFbFloor) fb_gain = kVeilFbFloor;
+      }
+      float regen = soft_clip(damped * fb_gain);
+      if (IsBad(regen)) regen = 0.0f;
+
+      // Keep the tank primed while frozen so holding FS2 blooms immediately
+      // instead of waiting for the line to fill. Inaudible when veil_amt is 0.
+      const float inject_gain =
+          kVeilInject * fmaxf(veil_amt, kVeilPrime * s_freeze.current);
+      float veil_in = soft_clip(delay_plus_space * inject_gain + regen);
+      if (IsBad(veil_in)) veil_in = 0.0f;
+      veil_delay.Write(veil_in);
+
+      // Output-only smear taps: stacking density that cannot destabilize the
+      // regen loop. Runs every sample so engage/release stay click-free.
+      const float drift =
+          sinf(kTwoPi * soft_veil_phase) * kVeilDriftSamps * veil_amt;
+      const float o1 =
+          veil_delay.Read(fclamp(len * kVeilTapFrac1 + drift, 1.0f, max_read));
+      const float o2 = veil_delay.Read(
+          fclamp(len * kVeilTapFrac2 - drift * 0.7f, 1.0f, max_read));
+      const float o3 = veil_delay.Read(
+          fclamp(len * kVeilTapFrac3 + drift * 0.45f, 1.0f, max_read));
+      float bloom = fb_read * kVeilGain0 + o1 * kVeilGain1 + o2 * kVeilGain2 +
+                    o3 * kVeilGain3;
+      const float bloom_diff = veil_diffuser.Process(bloom);
+      float diff_amt = kVeilDiffMix * veil_amt +
+                       kVeilFogDown * veil_amt * s_hold_absorb.current;
+      diff_amt = fclamp(diff_amt, 0.0f, 0.6f);
+      bloom = bloom * (1.0f - diff_amt) + bloom_diff * diff_amt;
+      bloom = soft_clip(bloom);
+      if (IsBad(bloom)) bloom = 0.0f;
+
+      // Bloom sits ON TOP of the bed (slight bed duck) rather than replacing it,
+      // so holding thickens instead of just changing level. Fade between the raw
+      // bed and the ceilinged bloomed version by veil_amt: at veil_amt 0 this is
+      // bit-identical to the untouched bed, so there is no step when FS2 engages.
+      const float bloomed = soft_clip(delay_plus_space * (1.0f - kVeilBedTrim) +
+                                      bloom * kVeilAdd);
+      wet_bed = delay_plus_space * (1.0f - veil_amt) + bloomed * veil_amt;
+      if (IsBad(wet_bed)) wet_bed = delay_plus_space;
     }
 
-    // FREEZE diffusion mask: base seam softener + Soft Veil fog (more on SW3 DOWN).
-    const float diffused = freeze_diffuser.Process(pre_diff);
-    float freeze_mask_amt =
+    // FREEZE diffusion mask: subtle seam softener (unchanged when veil idle).
+    const float diffused = freeze_diffuser.Process(wet_bed);
+    const float freeze_mask_amt =
         kFreezeDiffusionMix * s_freeze.current * s_freeze.current;
-    if (veil_amt > 0.001f) {
-      freeze_mask_amt += kVeilFogBase * veil_amt;
-      freeze_mask_amt += kVeilFogDown * veil_amt * s_hold_absorb.current;
-      freeze_mask_amt = fclamp(freeze_mask_amt, 0.0f, kVeilDiffMax);
-    }
     float wet_to_mix =
-        pre_diff * (1.0f - freeze_mask_amt) + diffused * freeze_mask_amt;
+        wet_bed * (1.0f - freeze_mask_amt) + diffused * freeze_mask_amt;
     if (IsBad(wet_to_mix)) wet_to_mix = delay_plus_space;
 
     // Constant-power dry/wet mix; pure dry at K1 minimum.
@@ -1172,7 +1267,7 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
       // kill_fade_gain (1.0 normally) fades the wet/held bed on emergency kill.
       out_mono = dry * dry_gain +
                  wet_to_mix * (wet_gain * freeze_wet_scale * kill_fade_gain);
-      // Live Delay Over Freeze: stays clear on top of Soft Veil stack wash.
+      // Live Delay Over Freeze: stays clear on top of Soft Veil bloom.
       const float live_over_gate =
           fmaxf(s_hold_live.current, s_hold_absorb.current);
       const float live_gain = s_freeze.current * live_over_gate;
@@ -1213,6 +1308,10 @@ int main() {
   live_reverse_lp.Init(kReverseToneHz, sample_rate);
   live_reverse_smooth.Init(kReverseSmoothHz, sample_rate);
   live_reverse_sum_hp.Init(kReverseSumHpHz, sample_rate);
+  veil_delay.Init(veil_buf, kVeilSize);
+  veil_diffuser.Init(veil_diff_buf, kVeilDiffSize, kVeilDiffDelay, kVeilDiffGain);
+  veil_damp.Init(kVeilDampHz, sample_rate);
+  veil_hp.Init(kVeilHpHz, sample_rate);
 
   led_freeze.Init(hw.seed.GetPin(Hothouse::LED_1), false);
   led_effect.Init(hw.seed.GetPin(Hothouse::LED_2), false);
@@ -1263,6 +1362,7 @@ int main() {
     } else {
       // Normal: LED1 follows freeze (soft dim-pulse during Soft Veil), LED2 bypass.
       if (soft_veil_active && freeze_active) {
+        // Soft dim-pulse while Soft Veil bloom is held.
         const float pulse =
             0.55f + 0.45f * (0.5f + 0.5f * sinf(soft_veil_phase * kTwoPi));
         led_freeze.Set(pulse);
