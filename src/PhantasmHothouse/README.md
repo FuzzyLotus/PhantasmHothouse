@@ -4,7 +4,7 @@ Contributed by David Viau \<<dalexviau@gmail.com>\>
 
 GPL firmware for Cleveland Music Co. Hothouse / Daisy Seed.
 
-**Current baseline:** [`phantasm-hothouse-v0.7f`](https://github.com/FuzzyLotus/PhantasmHothouse/releases/tag/phantasm-hothouse-v0.7f)
+**Current baseline:** [`phantasm-hothouse-v0.8f`](https://github.com/FuzzyLotus/PhantasmHothouse/releases/tag/phantasm-hothouse-v0.8f)
 
 Phantasmagoria-inspired reverse/freeze delay. Not an Echoplex clone.
 

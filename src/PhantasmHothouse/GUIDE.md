@@ -1,5 +1,7 @@
 # PhantasmHothouse User Guide
 
+Current firmware: phantasm-hothouse-v0.8f
+
 This is a short guide for someone using the pedal for the first time. It explains
 what each control does, how the freeze works, and what is still being built.
 
@@ -70,9 +72,11 @@ Bottom row:
 - FS2 BYPASS:
   - Tap: toggles bypass. When bypassed the output is your dry signal only.
   - Hold while frozen: Soft Veil. The frozen bed blooms into a warm, smeared
-    delay cloud (stacking / soft self-oscillation). Release and the bloom fades
-    while the locked freeze underneath stays. Live delay over freeze
-    (SW3 MIDDLE/DOWN) keeps playing normally on top.
+    delay cloud (stacking / soft self-oscillation). Hold longer and it builds,
+    then settles into a thick plateau instead of running away. Release and the
+    bloom fades while the locked freeze underneath stays. Live delay over freeze
+    (SW3 MIDDLE/DOWN) keeps playing normally on top. Soft Veil is expression
+    only: it does not rewrite the frozen memory.
 
 Bootloader: holding FS1 and FS2 together for about 3 seconds puts the pedal into
 update mode. FS1 by itself never does this, because FS1 is a performance control.
@@ -145,5 +149,7 @@ This is a work in progress. The items below are known and planned.
 - K3 controls how long things last. If the sound builds up too much, bring it down.
 - Freeze is most useful for holding a chord or texture and then playing over it
   with SW3 in the MIDDLE position.
+- Soft Veil (FS2 hold while frozen) is good for swelling a held chord into a
+  denser cloud, then letting go so the locked bed returns underneath.
 - If a freeze ever gets away from you, hold FS1 for the emergency kill to reset
   the bed quickly.
